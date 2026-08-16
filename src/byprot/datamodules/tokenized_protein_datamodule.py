@@ -44,6 +44,9 @@ class TokenizedProteinDataModule(LightningDataModule):
         struct_vocab_size: int = 8192,
         vocab_file: str = "",
         num_seqs: int = 40,  # used for testing
+        collater: str = "default",
+        struct_sample_ratio: Optional[float] = None,
+        antigen_max_len: Optional[int] = None,
     ):
         super().__init__()
 
@@ -70,6 +73,7 @@ class TokenizedProteinDataModule(LightningDataModule):
                 vocab_file=self.hparams.vocab_file,
                 split="train",
                 max_len=self.hparams.max_len,
+                antigen_max_len=getattr(self.hparams, "antigen_max_len", None),
                 struct_vocab_size=self.hparams.struct_vocab_size,
             )
             self.valid_dataset = TokenizedProteinDataset(
@@ -78,6 +82,7 @@ class TokenizedProteinDataModule(LightningDataModule):
                 vocab_file=self.hparams.vocab_file,
                 split="valid",
                 max_len=self.hparams.max_len,
+                antigen_max_len=getattr(self.hparams, "antigen_max_len", None),
                 struct_vocab_size=self.hparams.struct_vocab_size,
             )
             self.tokenizer = DPLM2Tokenizer.from_pretrained(
@@ -107,6 +112,7 @@ class TokenizedProteinDataModule(LightningDataModule):
             struct_vocab_size=self.hparams.struct_vocab_size,
             split="train",
             max_len=self.hparams.max_len,
+            antigen_max_len=getattr(self.hparams, "antigen_max_len", None),
         )
         dataset_pandas = self.train_dataset.data.to_pandas()
         if self.hparams.length_crop:
@@ -125,6 +131,8 @@ class TokenizedProteinDataModule(LightningDataModule):
             ),
             tokenizer=self.tokenizer,
             epoch=self.epoch,
+            collater=getattr(self.hparams, "collater", "default"),
+            struct_sample_ratio=getattr(self.hparams, "struct_sample_ratio", None),
         )
         return self.train_dl
 
@@ -135,6 +143,7 @@ class TokenizedProteinDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             max_len=self.hparams.max_len,
             tokenizer=self.tokenizer,
+            collater=getattr(self.hparams, "collater", "default"),
         )
 
     def test_dataloader(self):

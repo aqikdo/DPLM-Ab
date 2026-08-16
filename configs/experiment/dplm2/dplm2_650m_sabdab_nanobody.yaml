@@ -1,0 +1,22 @@
+# @package _global_
+# DPLM-2 650M LoRA finetune on strict SAbDab nanobody (VHH) tokens.
+
+defaults:
+  - dplm2/dplm2_650m
+
+name: dplm2_650m_sabdab_nanobody
+project: DPLM2_650m_sabdab_nanobody
+
+datamodule:
+  csv_file: sabdab_nanobody
+  vocab_file: ${paths.root_dir}/checkpoints/dplm2_650m
+  max_len: 512
+  max_tokens: 8192
+
+model:
+  training_stage: continue_train_from_dplm2
+  net:
+    name: ${paths.root_dir}/checkpoints/dplm2_650m
+    pretrained_model_name_or_path: ${paths.root_dir}/checkpoints/dplm2_650m
+  struct_tokenizer:
+    exp_path: ${paths.root_dir}/checkpoints/struct_tokenizer

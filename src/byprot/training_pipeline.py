@@ -39,9 +39,10 @@ def train(config: DictConfig) -> Optional[float]:
         seed_everything(config.seed, workers=True)
 
     # Convert relative ckpt path to absolute path if necessary
-    ckpt_path = not config.train.get(
-        "force_restart", False
-    ) and config.train.get("ckpt_path")
+    if config.train.get("force_restart", False):
+        ckpt_path = None
+    else:
+        ckpt_path = config.train.get("ckpt_path")
     if ckpt_path:
         ckpt_path = utils.resolve_ckpt_path(
             ckpt_dir=config.paths.ckpt_dir, ckpt_path=ckpt_path
@@ -56,6 +57,13 @@ def train(config: DictConfig) -> Optional[float]:
 
     # loading pipeline
     datamodule, pl_module, logger, callbacks = utils.common_pipeline(config)
+
+    # Optional: load weights only (fresh optimizer/scheduler) for multi-stage FT.
+    # Distinct from train.ckpt_path, which resumes full Lightning training state.
+    init_from = config.train.get("init_from_ckpt")
+    if init_from:
+        log.info(f"Initializing weights from <{init_from}>")
+        pl_module.load_from_ckpt(str(init_from))
 
     # Init lightning trainer
     log.info(f"Instantiating trainer <{config.trainer._target_}>")

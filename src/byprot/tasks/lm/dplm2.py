@@ -78,12 +78,132 @@ class DPLM2TrainingTask(TaskLitModule):
         elif self.stage == "test":
             self.test_step_outputs = []
 
+    def on_train_start(self):
+        super().on_train_start()
+        cfg = getattr(self.model, "cfg", None)
+        if (
+            cfg is not None
+            and getattr(getattr(cfg, "antigen_condition", None), "enable", False)
+            and getattr(getattr(cfg, "two_stage", None), "enable", False)
+        ):
+            if self.global_step < int(cfg.two_stage.stage1_steps):
+                self.model.freeze_for_stage1()
+            else:
+                self.model.unfreeze_for_stage2()
+
+    def on_train_batch_start(self, batch, batch_idx):
+        super().on_train_batch_start(batch, batch_idx)
+        cfg = getattr(self.model, "cfg", None)
+        if not (
+            cfg is not None
+            and getattr(getattr(cfg, "antigen_condition", None), "enable", False)
+            and getattr(getattr(cfg, "two_stage", None), "enable", False)
+        ):
+            return
+        if (
+            self.global_step >= int(cfg.two_stage.stage1_steps)
+            and getattr(self.model, "_conditional_stage", None) != "stage2"
+        ):
+            self.model.unfreeze_for_stage2()
+            scale = float(cfg.two_stage.stage2_lr_scale)
+            for optimizer in self.trainer.optimizers:
+                for group in optimizer.param_groups:
+                    group["lr"] = group["lr"] * scale
+
     def on_before_optimizer_step(self, optimizer):
         if self.global_rank == 0:
             grad_norm_dict = grad_norm(
                 self.trainer.strategy.model, norm_type=2
             )
             self.log_dict(grad_norm_dict)
+
+    def configure_optimizers(self):
+        """Param groups: LoRA / other, cross-attn (scaled), antigen encoder (scaled)."""
+        from byprot.utils.lr_scheduler import get_scheduler
+        from byprot.utils.optim import get_optimizer
+
+        opt_cfg = self.hparams.optimizer
+        base_lr = float(opt_cfg.lr)
+        model_cfg = getattr(self.model, "cfg", None)
+        xattn_scale = 1.0
+        ag_scale = 1.0
+        if model_cfg is not None and getattr(
+            getattr(model_cfg, "antigen_condition", None), "enable", False
+        ):
+            xattn_scale = float(
+                getattr(model_cfg.antigen_condition, "cross_attn_lr_scale", 1.0)
+            )
+            ag_scale = float(
+                getattr(
+                    getattr(model_cfg, "two_stage", None),
+                    "antigen_encoder_lr_scale",
+                    1.0,
+                )
+            )
+
+        # Ensure stage freeze flags match intended trainable set before grouping.
+        if (
+            model_cfg is not None
+            and getattr(getattr(model_cfg, "antigen_condition", None), "enable", False)
+            and getattr(getattr(model_cfg, "two_stage", None), "enable", False)
+            and int(model_cfg.two_stage.stage1_steps) <= 0
+        ):
+            self.model.unfreeze_for_stage2()
+
+        cross, ag, other = [], [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "conditional_crossattention" in name:
+                cross.append(p)
+            elif "antigen_encoder" in name:
+                ag.append(p)
+            else:
+                other.append(p)
+
+        param_groups = []
+        if other:
+            param_groups.append(
+                {"params": other, "lr": base_lr, "name": "lora_other"}
+            )
+        if cross:
+            param_groups.append(
+                {
+                    "params": cross,
+                    "lr": base_lr * xattn_scale,
+                    "name": "cross_attn",
+                }
+            )
+        if ag:
+            param_groups.append(
+                {
+                    "params": ag,
+                    "lr": base_lr * ag_scale,
+                    "name": "antigen_encoder",
+                }
+            )
+        if not param_groups:
+            param_groups = [p for p in self.parameters() if p.requires_grad]
+
+        log.info(
+            "Optimizer groups: "
+            f"lora_other={len(other)}@{base_lr:g}, "
+            f"cross_attn={len(cross)}@{(base_lr * xattn_scale):g}, "
+            f"antigen_encoder={len(ag)}@{(base_lr * ag_scale):g}"
+        )
+        optimizer = get_optimizer(opt_cfg, param_groups)
+        if (
+            "lr_scheduler" in self.hparams
+            and self.hparams.lr_scheduler is not None
+        ):
+            lr_scheduler, extra_kwargs = get_scheduler(
+                self.hparams.lr_scheduler, optimizer
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": lr_scheduler, **extra_kwargs},
+            }
+        return optimizer
 
     def build_model(self):
         log.info(f"Instantiating neural model <{self.hparams.model._target_}>")
@@ -108,6 +228,8 @@ class DPLM2TrainingTask(TaskLitModule):
         self.eval_aatype_loss = MeanMetric()
         self.eval_struct_acc = MeanMetric()
         self.eval_aatype_acc = MeanMetric()
+        self.eval_epitope_loss = MeanMetric()
+        self.eval_epitope_acc = MeanMetric()
 
     def load_from_ckpt(self, ckpt_path, not_load=False):
         # do not load state dict from ckpt, just use the initialized parameters.
@@ -134,9 +256,14 @@ class DPLM2TrainingTask(TaskLitModule):
         - tokens: LongTensor [bsz, len], sequence of amino acids
         """
         weighting = self.hparams.learning.weight
-        logits, targets, loss_masks, weights = self.model.compute_loss(
-            batch, weighting=weighting
+        outputs = self.model.compute_loss(
+            batch, weighting=weighting, global_step=int(self.global_step)
         )
+        if len(outputs) == 4:
+            logits, targets, loss_masks, weights = outputs
+            aux_outputs = {}
+        else:
+            logits, targets, loss_masks, weights, aux_outputs = outputs
 
         loss, logging_output = self.criterion(
             logits,
@@ -146,6 +273,43 @@ class DPLM2TrainingTask(TaskLitModule):
             watch_t1_t2_loss=self.hparams.learning.watch_t1_t2_loss,
             cal_constant_loss=self.hparams.learning.cal_constant_loss,
         )
+
+        if "mask_scale" in aux_outputs:
+            logging_output["mask_scale"] = float(aux_outputs["mask_scale"])
+        if "prog_scale" in aux_outputs:
+            logging_output["prog_scale"] = float(aux_outputs["prog_scale"])
+        if "cdr_noise_ratio" in aux_outputs:
+            logging_output["cdr_noise_ratio"] = float(aux_outputs["cdr_noise_ratio"])
+
+        if "epitope_logits" in aux_outputs and "epitope_labels" in aux_outputs:
+            epi_w = float(aux_outputs.get("epitope_loss_weight", 1.0))
+            if epi_w > 0.0:
+                epitope_logits = aux_outputs["epitope_logits"]
+                epitope_labels = aux_outputs["epitope_labels"]
+                epitope_mask = aux_outputs["epitope_mask"].bool()
+                valid_logits = epitope_logits[epitope_mask]
+                valid_labels = epitope_labels[epitope_mask]
+                if valid_logits.numel() > 0:
+                    pos = valid_labels.sum()
+                    neg = valid_labels.numel() - pos
+                    pos_weight = (
+                        (neg / pos.clamp_min(1.0))
+                        if pos.item() > 0
+                        else valid_labels.new_tensor(1.0)
+                    )
+                    epitope_loss = F.binary_cross_entropy_with_logits(
+                        valid_logits,
+                        valid_labels,
+                        pos_weight=pos_weight,
+                    )
+                    loss = loss + epi_w * epitope_loss
+                    with torch.no_grad():
+                        epitope_pred = (valid_logits > 0).float()
+                        epitope_acc = (epitope_pred == valid_labels).float().mean()
+                    logging_output["epitope/loss"] = epitope_loss.detach()
+                    logging_output["epitope/acc"] = epitope_acc.detach()
+                    logging_output["epitope/pos_weight"] = pos_weight.detach()
+                    logging_output["epitope/sample_size"] = valid_labels.numel()
 
         # calculate index accuracy
         logging_output["aatype/index_accuracy"] = cal_index_acc(
@@ -235,6 +399,10 @@ class DPLM2TrainingTask(TaskLitModule):
         self.eval_struct_acc.update(
             logging_output["struct/index_accuracy"], weight=sample_size
         )
+        if "epitope/loss" in logging_output:
+            epi_size = int(logging_output.get("epitope/sample_size", 1))
+            self.eval_epitope_loss.update(logging_output["epitope/loss"], weight=epi_size)
+            self.eval_epitope_acc.update(logging_output["epitope/acc"], weight=epi_size)
 
         return {"loss": loss}
 
@@ -256,6 +424,10 @@ class DPLM2TrainingTask(TaskLitModule):
         self.eval_aatype_acc.reset()
         eval_struct_accuracy = self.eval_struct_acc.compute()
         self.eval_struct_acc.reset()
+        eval_epitope_loss = self.eval_epitope_loss.compute()
+        self.eval_epitope_loss.reset()
+        eval_epitope_accuracy = self.eval_epitope_acc.compute()
+        self.eval_epitope_acc.reset()
 
         self.log(
             f"{log_key}/loss",
@@ -307,6 +479,21 @@ class DPLM2TrainingTask(TaskLitModule):
             on_epoch=True,
             prog_bar=True,
         )
+        if not torch.isnan(eval_epitope_loss):
+            self.log(
+                f"{log_key}/epitope_loss",
+                eval_epitope_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+            )
+            self.log(
+                f"{log_key}/epitope_acc",
+                eval_epitope_accuracy,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+            )
 
         if self.stage == "fit":
             self.val_ppl_best.update(eval_ppl)

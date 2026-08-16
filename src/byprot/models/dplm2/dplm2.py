@@ -41,6 +41,122 @@ class StructTokenizerConfig:
 
 
 @dataclass
+class MixedTrainingConfig:
+    enable: bool = field(default=False)
+
+
+@dataclass
+class AntigenConditionConfig:
+    enable: bool = field(default=False)
+    freeze_encoder: bool = field(default=True)
+    epitope_loss_weight: float = field(default=1.0)
+    # After Ag encoder, add a learned 0/1 epitope embedding onto Ag hidden
+    # states that feed Ab→Ag cross-attn. Full Ag (pad mask only) remains visible;
+    # epitope is an extra binary feature, not a key-dropping mask.
+    epitope_cross_attn_feature: bool = field(default=False)
+    # Deprecated / unused: previous hard key-mask experiment. Kept so old
+    # configs still load; do not re-enable.
+    epitope_cross_attn_mask: bool = field(default=False)
+    # If True, cross-attn out_proj is zero-init (identity at start).
+    # If False, use default Linear init so antigen signal is present immediately.
+    cross_attn_zero_init: bool = field(default=True)
+    # Multiply base LR for conditional cross-attn params (aggressive Ag injection).
+    cross_attn_lr_scale: float = field(default=1.0)
+    # Epitope predictor: TransformerDecoder over Ag tokens, cross-attending to Ab
+    # last_hidden_state (pre-lm_head, struct+aa).
+    epitope_transformer_layers: int = field(default=2)
+    epitope_transformer_heads: int = field(default=8)
+    epitope_transformer_dropout: float = field(default=0.1)
+    net: NetConfig = field(default=NetConfig())
+
+
+class EpitopeTransformerPredictor(nn.Module):
+    """Predict Ag-residue epitope from Ag encoder states + Ab pre-lm_head states.
+
+    Ag aa-token hidden states are queries; Ab backbone last_hidden_state
+    (struct+aa, after conditional cross-attn) is memory / K,V.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        nhead: int = 8,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.ag_norm = nn.LayerNorm(hidden_size)
+        self.ab_norm = nn.LayerNorm(hidden_size)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=hidden_size,
+            nhead=nhead,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.out_norm = nn.LayerNorm(hidden_size)
+        self.out_proj = nn.Linear(hidden_size, 1)
+
+    def forward(
+        self,
+        ag_hidden: torch.Tensor,
+        ab_hidden: torch.Tensor,
+        ag_key_padding_mask: Optional[torch.Tensor] = None,
+        ab_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        tgt = self.ag_norm(ag_hidden)
+        memory = self.ab_norm(ab_hidden)
+        hidden = self.decoder(
+            tgt=tgt,
+            memory=memory,
+            tgt_key_padding_mask=ag_key_padding_mask,
+            memory_key_padding_mask=ab_key_padding_mask,
+        )
+        return self.out_proj(self.out_norm(hidden)).squeeze(-1)
+
+
+@dataclass
+class CdrGenerationConfig:
+    """Only noise/supervise CDR residues; keep framework aa+struct clean."""
+
+    enable: bool = field(default=False)
+
+
+@dataclass
+class MaskScheduleConfig:
+    """Curriculum on mask probability: scale * (t / T).
+
+    Spatial CDR restriction is controlled by ``cdr_generation`` and/or
+    ``cdr_noise_ratio`` (fraction of each batch that uses CDR-only + progressive
+    scale; the rest uses original full-sequence masking at scale=1.0).
+    """
+
+    enable: bool = field(default=False)
+    warmup_steps: int = field(default=1500)
+    min_scale: float = field(default=0.1)
+    max_scale: float = field(default=1.0)
+    schedule: str = field(default="linear")  # linear | cosine
+    # 0.0 = legacy (all samples follow cdr_generation flag);
+    # (0, 1] = mix: this fraction uses CDR-only + progressive scale,
+    #         remainder uses original full masking @ scale=1.0.
+    cdr_noise_ratio: float = field(default=0.0)
+
+
+@dataclass
+class TwoStageTrainingConfig:
+    enable: bool = field(default=False)
+    stage1_steps: int = field(default=1000)
+    stage2_lr_scale: float = field(default=0.1)
+    freeze_backbone: bool = field(default=True)
+    freeze_antigen_encoder: bool = field(default=True)
+    # When antigen encoder is trainable, scale its LR relative to base LR.
+    antigen_encoder_lr_scale: float = field(default=1.0)
+
+
+@dataclass
 class DPLM2Config:
     ## DPLM model
     num_diffusion_timesteps: int = field(default=500)
@@ -59,11 +175,29 @@ class DPLM2Config:
     inverse_folding_loss_ratio: float = field(default=0.25)
     joint_loss_ratio: float = field(default=0.25)
     independent_loss_ratio: float = field(default=0.0)
+    zero_struct_loss: bool = field(default=False)
+    mixed_training: MixedTrainingConfig = field(default=MixedTrainingConfig())
+
+    ## finetune task: null (full multimodal) | sequence_generation | backbone_generation
+    finetune_task: Optional[str] = field(default=None)
+
+    ## optional finetune freezes (toggle via yaml / CLI overrides)
+    freeze_word_embeddings: bool = field(default=False)
+    freeze_position_embeddings: bool = field(default=False)
+    freeze_lm_head_decoder: bool = field(default=False)
+    freeze_lm_head: bool = field(default=False)
+    freeze_encoder: bool = field(default=False)
 
     ## struct tokenizer
     struct_tokenizer: StructTokenizerConfig = field(
         default=StructTokenizerConfig()
     )
+    antigen_condition: AntigenConditionConfig = field(
+        default=AntigenConditionConfig()
+    )
+    two_stage: TwoStageTrainingConfig = field(default=TwoStageTrainingConfig())
+    cdr_generation: CdrGenerationConfig = field(default=CdrGenerationConfig())
+    mask_schedule: MaskScheduleConfig = field(default=MaskScheduleConfig())
 
 
 @register_model("dplm2")
@@ -90,8 +224,76 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
         if self.cfg.gradient_ckpt:
             self.net.supports_gradient_checkpointing = True
             self.net.gradient_checkpointing_enable()
+            # Peft / frozen-embedding + gradient checkpointing drops all grads
+            # unless at least one input tensor requires grad.
+            self._ensure_input_require_grads()
 
+        self.antigen_encoder = self._build_antigen_encoder()
+        if (
+            self.cfg.gradient_ckpt
+            and exists(self.antigen_encoder)
+            and hasattr(self.antigen_encoder, "gradient_checkpointing_enable")
+        ):
+            self.antigen_encoder.supports_gradient_checkpointing = True
+            self.antigen_encoder.gradient_checkpointing_enable()
+        self.epitope_head = self._build_epitope_head()
+        self.epitope_feature_embed = self._build_epitope_feature_embed()
         self._struct_tokenizer = None
+        self._conditional_stage = None
+        self.apply_parameter_freeze()
+
+    def _ensure_input_require_grads(self):
+        """Make encoder inputs require grad so checkpointing keeps adapter grads.
+
+        With Peft, `modules_to_save` often wraps the whole `esm.embeddings` module.
+        DPLM2 also builds `inputs_embeds` via `self.net.esm.embeddings(...)` before
+        the encoder, so the hook must sit on that embeddings module.
+        """
+        if getattr(self, "_input_require_grads_hooked", False):
+            return
+
+        embeddings_mod = None
+        net = self.net
+        try:
+            esm = getattr(net, "esm", None)
+            if esm is None:
+                base = getattr(net, "base_model", None)
+                model = getattr(base, "model", base) if base is not None else None
+                esm = getattr(model, "esm", None) if model is not None else None
+            if esm is not None and hasattr(esm, "embeddings"):
+                embeddings_mod = esm.embeddings
+        except Exception:
+            embeddings_mod = None
+        if embeddings_mod is None:
+            return
+
+        def _hook(module, inp, out):
+            if torch.is_tensor(out):
+                return out.requires_grad_(True)
+            return out
+
+        embeddings_mod.register_forward_hook(_hook)
+        self._input_require_grads_hooked = True
+
+    def apply_parameter_freeze(self):
+        if self.cfg.freeze_encoder:
+            for p in self.net.esm.encoder.parameters():
+                p.requires_grad = False
+        if self.cfg.freeze_word_embeddings:
+            self.net.esm.embeddings.word_embeddings.weight.requires_grad = False
+        if self.cfg.freeze_position_embeddings:
+            self.net.esm.embeddings.position_embeddings.weight.requires_grad = False
+        if self.cfg.freeze_lm_head_decoder:
+            self.net.lm_head.decoder.weight.requires_grad = False
+        if self.cfg.freeze_lm_head:
+            for p in self.net.lm_head.parameters():
+                p.requires_grad = False
+        if (
+            exists(self.antigen_encoder)
+            and getattr(self.cfg.antigen_condition, "freeze_encoder", False)
+        ):
+            for p in self.antigen_encoder.parameters():
+                p.requires_grad = False
 
     def _update_cfg(self, cfg):
         self.cfg = OmegaConf.merge(self._default_cfg, cfg)
@@ -119,6 +321,8 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
     def from_pretrained(
         cls, net_name, cfg_override={}, net_override={}, from_huggingface=True
     ):
+        if str(net_name).endswith(".ckpt"):
+            from_huggingface = False
         if not from_huggingface:
             # Load model checkpoint from local if you pretrain a DPLM with this repo
             # The net_name should be like:
@@ -129,8 +333,16 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
 
             from byprot.utils.config import load_yaml_config
 
-            cfg_path = Path(net_name).parents[1]
-            cfg_path = Path(cfg_path, ".hydra", "config.yaml")
+            cfg_path = None
+            for parent in Path(net_name).parents:
+                candidate = parent / ".hydra" / "config.yaml"
+                if candidate.is_file():
+                    cfg_path = candidate
+                    break
+            if cfg_path is None:
+                raise FileNotFoundError(
+                    f"No .hydra/config.yaml found for checkpoint: {net_name}"
+                )
             cfg = load_yaml_config(str(cfg_path))
             OmegaConf.resolve(cfg)
             cfg = cfg.model
@@ -186,6 +398,95 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
         self.struct_type = 0
         self.pad_type = 2
 
+    def _build_antigen_encoder(self):
+        if not getattr(self.cfg.antigen_condition, "enable", False):
+            return None
+        antigen_net_cfg = OmegaConf.to_container(
+            self.cfg.antigen_condition.net, resolve=True
+        )
+        if not antigen_net_cfg.get("name"):
+            antigen_net_cfg["name"] = self.cfg.net.name
+        if not antigen_net_cfg.get("pretrained_model_name_or_path"):
+            antigen_net_cfg["pretrained_model_name_or_path"] = (
+                self.cfg.net.pretrained_model_name_or_path or self.cfg.net.name
+            )
+        if not antigen_net_cfg.get("pretrain"):
+            antigen_net_cfg["pretrain"] = True
+        antigen_cfg = OmegaConf.create(
+            {
+                "training_stage": self.cfg.training_stage,
+                "net": antigen_net_cfg,
+                "tokenizer": {"vocab_size": len(self.tokenizer)},
+                "lora": {"enable": False},
+                "antigen_condition": {"enable": False},
+            }
+        )
+        return get_net_dplm2(antigen_cfg)
+
+    def _build_epitope_head(self):
+        if not getattr(self.cfg.antigen_condition, "enable", False):
+            return None
+        cfg = self.cfg.antigen_condition
+        # epitope_loss_weight<=0 means disable epitope head entirely
+        if float(getattr(cfg, "epitope_loss_weight", 1.0)) <= 0.0:
+            return None
+        hidden = self.net.config.hidden_size
+        return EpitopeTransformerPredictor(
+            hidden_size=hidden,
+            nhead=int(getattr(cfg, "epitope_transformer_heads", 8)),
+            num_layers=int(getattr(cfg, "epitope_transformer_layers", 2)),
+            dropout=float(getattr(cfg, "epitope_transformer_dropout", 0.1)),
+        )
+
+    def _build_epitope_feature_embed(self):
+        """Learned 0/1 embedding added to Ag encoder states for cross-attn."""
+        if not getattr(self.cfg.antigen_condition, "enable", False):
+            return None
+        if not bool(
+            getattr(
+                self.cfg.antigen_condition, "epitope_cross_attn_feature", False
+            )
+        ):
+            return None
+        hidden = self.net.config.hidden_size
+        embed = nn.Embedding(2, hidden)
+        # Zero-init → starts as no-op; model learns epitope bias from data.
+        nn.init.zeros_(embed.weight)
+        return embed
+
+    def predict_epitopes(
+        self,
+        antigen_hidden_states,
+        antibody_hidden_states=None,
+        antigen_attention_mask=None,
+        antibody_attention_mask=None,
+    ):
+        if not exists(self.epitope_head) or antigen_hidden_states is None:
+            return None
+        if antibody_hidden_states is None:
+            return None
+        # Antigen encoder concat is [struct | aa]; epitope labels align to aa half.
+        if antigen_hidden_states.size(1) % 2 == 0:
+            _, antigen_hidden_states = antigen_hidden_states.chunk(2, dim=1)
+            if antigen_attention_mask is not None:
+                _, antigen_attention_mask = antigen_attention_mask.chunk(2, dim=1)
+        ag_pad = (
+            ~antigen_attention_mask.bool()
+            if antigen_attention_mask is not None
+            else None
+        )
+        ab_pad = (
+            ~antibody_attention_mask.bool()
+            if antibody_attention_mask is not None
+            else None
+        )
+        return self.epitope_head(
+            antigen_hidden_states,
+            antibody_hidden_states,
+            ag_key_padding_mask=ag_pad,
+            ab_key_padding_mask=ab_pad,
+        )
+
     @property
     def device(self):
         try:
@@ -203,14 +504,30 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
             ).to(self.device)
         return self._struct_tokenizer
 
-    def q_sample(self, x_0, t, type_ids, maskable_mask):
+    def _mask_scale(self, global_step: int = 0) -> float:
+        """Return curriculum scale for mask probability (relative to t/T)."""
+        cfg = getattr(self.cfg, "mask_schedule", None)
+        if cfg is None or not bool(getattr(cfg, "enable", False)):
+            return 1.0
+        warmup = max(int(getattr(cfg, "warmup_steps", 1500)), 1)
+        min_s = float(getattr(cfg, "min_scale", 0.1))
+        max_s = float(getattr(cfg, "max_scale", 1.0))
+        progress = min(1.0, float(global_step) / float(warmup))
+        schedule = str(getattr(cfg, "schedule", "linear")).lower()
+        if schedule == "cosine":
+            # Smooth ramp from min to max over warmup.
+            progress = 0.5 * (1.0 - math.cos(math.pi * progress))
+        return min_s + (max_s - min_s) * progress
+
+    def q_sample(self, x_0, t, type_ids, maskable_mask, mask_scale: float = 1.0):
         aa_position = type_ids == self.aa_type
         struct_position = type_ids == self.struct_type
 
-        # sample x_t
+        # sample x_t; mask_scale curricula the Bernoulli probability vs t/T
         u = torch.rand_like(x_0, dtype=torch.float)
+        scale = float(mask_scale)
         t_mask = (
-            u < (t / self.cfg.num_diffusion_timesteps)[:, None]
+            u < (t.float() / self.cfg.num_diffusion_timesteps * scale)[:, None]
         ) & maskable_mask
         x_t = x_0.masked_fill(t_mask & aa_position, self.aa_mask_id)
         x_t = x_t.masked_fill(t_mask & struct_position, self.struct_mask_id)
@@ -226,34 +543,113 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
         modality_type[~input_mask] = self.pad_type
         return modality_type
 
-    def forward(self, input_ids, **kwargs):
+    def _build_attention_bias(self, input_ids, single_modality=None):
         input_mask = input_ids.ne(self.pad_id)
-
-        type_ids = self.get_modality_type(input_ids)
-
         L = input_ids.shape[1]
         num_heads = self.net.config.num_attention_heads
-        # [B, num_heads, L+2, L+2]
         attention_bias: torch.FloatType = (
             self.net.esm.get_extended_attention_mask(
                 input_mask, input_ids.shape
             ).repeat(1, num_heads, L, 1)
-        )  # -inf for padding positions, 0 otherwise
-
-        if "single_modality" in kwargs:
-            single_modality_index = kwargs["single_modality"]
+        )
+        if single_modality is not None:
             struct_attention_bias, aa_attention_bias = attention_bias.chunk(
                 2, dim=-2
             )
             struct_attention_bias[
-                single_modality_index, :, :, L // 2 :
+                single_modality, :, :, L // 2 :
             ] = -math.inf
             aa_attention_bias[
-                single_modality_index, :, :, : L // 2
+                single_modality, :, :, : L // 2
             ] = -math.inf
             attention_bias = torch.concat(
                 [struct_attention_bias, aa_attention_bias], dim=-2
             )
+        return input_mask, attention_bias
+
+    def _concat_modal_tokens(self, struct_tokens, aatype_tokens):
+        return torch.concat([struct_tokens, aatype_tokens], dim=1)
+
+    def _epitope_ids_for_cross_attn(self, antigen_batch, aa_len, device):
+        """Build [B, 2*aa_len] long ids (0/1) aligned to Ag [struct|aa].
+
+        epitope_labels are aa-half length (incl. CLS/EOS). Missing labels → all 0.
+        """
+        labels = antigen_batch.get("epitope_labels")
+        if labels is None:
+            return torch.zeros(
+                antigen_batch["aatype_tokens"]["targets"].size(0),
+                aa_len * 2,
+                dtype=torch.long,
+                device=device,
+            )
+        epi = labels.to(device=device, dtype=torch.float)
+        if epi.dim() == 1:
+            epi = epi.unsqueeze(0)
+        bsz = epi.size(0)
+        if epi.size(1) < aa_len:
+            epi = torch.nn.functional.pad(epi, (0, aa_len - epi.size(1)))
+        elif epi.size(1) > aa_len:
+            epi = epi[:, :aa_len]
+        epi_ids = (epi > 0.5).long()
+        return torch.cat([epi_ids, epi_ids], dim=1)
+
+    def _apply_epitope_feature(self, hidden, antigen_batch):
+        """Add 0/1 epitope embedding onto Ag hidden states (full Ag still visible)."""
+        if not exists(self.epitope_feature_embed):
+            return hidden
+        bsz, full_len, _ = hidden.shape
+        if full_len % 2 != 0:
+            return hidden
+        aa_len = full_len // 2
+        epi_ids = self._epitope_ids_for_cross_attn(
+            antigen_batch, aa_len, hidden.device
+        )
+        if epi_ids.size(0) != bsz:
+            return hidden
+        return hidden + self.epitope_feature_embed(epi_ids)
+
+    def encode_antigen(self, antigen_batch):
+        if not exists(self.antigen_encoder) or antigen_batch is None:
+            return None
+        antigen_input_ids = self._concat_modal_tokens(
+            antigen_batch["struct_tokens"]["targets"],
+            antigen_batch["aatype_tokens"]["targets"],
+        )
+        antigen_mask, antigen_attention_bias = self._build_attention_bias(
+            antigen_input_ids
+        )
+        antigen_type_ids = self.get_modality_type(antigen_input_ids)
+        antigen_inputs_embeds = self.antigen_encoder.esm.embeddings(
+            antigen_input_ids, attention_mask=antigen_mask
+        )
+        outputs = self.antigen_encoder.esm(
+            input_ids=antigen_input_ids,
+            inputs_embeds=antigen_inputs_embeds,
+            attention_mask=antigen_attention_bias,
+            type_ids=antigen_type_ids,
+        )
+        hidden = outputs.last_hidden_state
+        has_antigen = antigen_batch.get("has_antigen")
+        if has_antigen is not None:
+            hidden = hidden * has_antigen.to(hidden.device)[:, None, None].float()
+        # Extra 0/1 epitope feature only for Ab→Ag cross-attn keys/values.
+        # epitope_head still scores raw encoder states over full Ag.
+        hidden_for_xattn = self._apply_epitope_feature(hidden, antigen_batch)
+        return {
+            "input_ids": antigen_input_ids,
+            "attention_mask": antigen_mask,
+            "pad_attention_mask": antigen_mask,
+            "hidden_states": hidden_for_xattn,
+            "encoder_hidden_states": hidden,
+        }
+
+    def forward(self, input_ids, **kwargs):
+        type_ids = self.get_modality_type(input_ids)
+        single_modality_index = kwargs.get("single_modality")
+        input_mask, attention_bias = self._build_attention_bias(
+            input_ids, single_modality=single_modality_index
+        )
 
         # [B, L, d_model]
         input_embeds = self.net.esm.embeddings(
@@ -265,6 +661,8 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
             inputs_embeds=input_embeds,
             attention_mask=attention_bias,
             type_ids=type_ids,
+            conditional_hidden_states=kwargs.get("antigen_hidden_states"),
+            conditional_attention_mask=kwargs.get("antigen_attention_mask"),
         )
 
         return outputs
@@ -314,9 +712,16 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
         mixup_loss_mask = non_special_sym_mask
         return mixup_input_ids, mixup_loss_mask
 
-    def construct_x_t(self, struct_target, aatype_target):
+    def _mixed_training_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "mixed_training", None) and self.cfg.mixed_training.enable)
+
+    def _zero_struct_loss_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "zero_struct_loss", False))
+
+    def _construct_x_t_with_targets(
+        self, struct_target, aatype_target, cdr_mask=None, mask_scale: float = 1.0
+    ):
         bsz = struct_target.size(0)
-        # seperately add noise to struct and aa
         struct_t = torch.randint(
             1,
             self.cfg.num_diffusion_timesteps + 1,
@@ -328,15 +733,6 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
             self.cfg.num_diffusion_timesteps + 1,
             (bsz,),
             device=aatype_target.device,
-        )
-
-        assert (
-            self.cfg.single_modality_ratio
-            + self.cfg.folding_loss_ratio
-            + self.cfg.inverse_folding_loss_ratio
-            + self.cfg.joint_loss_ratio
-            + self.cfg.independent_loss_ratio
-            == 1.0
         )
 
         split_sizes = [
@@ -353,9 +749,7 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
 
         bool_index_list = []
         for int_index in int_index_list:
-            bool_index = torch.zeros(bsz, dtype=torch.bool).to(
-                struct_target.device
-            )
+            bool_index = torch.zeros(bsz, dtype=torch.bool, device=struct_target.device)
             bool_index[int_index] = True
             bool_index_list.append(bool_index)
 
@@ -373,7 +767,8 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
             struct_target,
             struct_t,
             struct_type_id,
-            maskable_mask=self.get_non_special_symbol_mask(struct_target),
+            maskable_mask=self._cdr_maskable_mask(struct_target, cdr_mask),
+            mask_scale=mask_scale,
         )
         aatype_t = aatype_t.masked_fill(folding_index, 0)
         aatype_t = aatype_t.masked_scatter(joint_index, struct_t[joint_index])
@@ -382,7 +777,8 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
             aatype_target,
             aatype_t,
             aa_type_id,
-            maskable_mask=self.get_non_special_symbol_mask(aatype_target),
+            maskable_mask=self._cdr_maskable_mask(aatype_target, cdr_mask),
+            mask_scale=mask_scale,
         )
 
         return (
@@ -391,16 +787,340 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
             single_modality_index,
         )
 
-    def compute_loss(self, batch, weighting="linear"):
+    def _construct_x_t_seq_only_dummy(self, struct_target, aatype_target):
+        """Match dummy_struct + zero_struct_loss + single_modality_ratio=1.0.
+
+        Both halves are noised; struct loss is dropped; AA cannot attend to
+        struct (single_modality). Used for every NGS row in mixed training so
+        sr=0 is equivalent to the legacy pure-seq recipe.
+        """
+        bsz = struct_target.size(0)
+        device = struct_target.device
+        num_timesteps = self.cfg.num_diffusion_timesteps
+        struct_t = torch.randint(
+            1, num_timesteps + 1, (bsz,), device=device
+        )
+        aatype_t = torch.randint(
+            1, num_timesteps + 1, (bsz,), device=device
+        )
+        single_modality_index = torch.ones(bsz, dtype=torch.bool, device=device)
+
+        struct_x_t, struct_loss_mask = self.q_sample(
+            struct_target,
+            struct_t,
+            self.get_modality_type(struct_target),
+            maskable_mask=self.get_non_special_symbol_mask(struct_target),
+        )
+        aatype_x_t, aa_loss_mask = self.q_sample(
+            aatype_target,
+            aatype_t,
+            self.get_modality_type(aatype_target),
+            maskable_mask=self.get_non_special_symbol_mask(aatype_target),
+        )
+        # Never supervise dummy/placeholder struct on NGS.
+        struct_loss_mask = torch.zeros_like(struct_loss_mask)
+        return (
+            {"t": struct_t, "x_t": struct_x_t, "mask": struct_loss_mask},
+            {"t": aatype_t, "x_t": aatype_x_t, "mask": aa_loss_mask},
+            single_modality_index,
+        )
+
+    def _construct_x_t_mixed(self, struct_target, aatype_target, is_ngs, mask_scale: float = 1.0):
+        """Mixed NGS+struct noising.
+
+        Struct rows: full 4-way multimodal objective.
+        NGS rows: identical to dummy pure-seq
+        (``_construct_x_t_seq_only_dummy``).
+        """
+        bsz = struct_target.size(0)
+        device = struct_target.device
+        struct_t = torch.randint(
+            1, self.cfg.num_diffusion_timesteps + 1, (bsz,), device=device
+        )
+        aatype_t = torch.randint(
+            1, self.cfg.num_diffusion_timesteps + 1, (bsz,), device=device
+        )
+        single_modality_index = torch.ones(bsz, dtype=torch.bool, device=device)
+
+        struct_x_t = struct_target.clone()
+        aatype_x_t = aatype_target.clone()
+        struct_loss_mask = torch.zeros_like(struct_target, dtype=torch.bool)
+        aa_loss_mask = torch.zeros_like(aatype_target, dtype=torch.bool)
+
+        struct_idx = (~is_ngs).nonzero(as_tuple=True)[0]
+        ngs_idx = is_ngs.nonzero(as_tuple=True)[0]
+
+        if struct_idx.numel() > 0:
+            (
+                struct_noised,
+                aatype_noised,
+                struct_single,
+            ) = self._construct_x_t_with_targets(
+                struct_target[struct_idx],
+                aatype_target[struct_idx],
+                mask_scale=mask_scale,
+            )
+            struct_t[struct_idx] = struct_noised["t"]
+            aatype_t[struct_idx] = aatype_noised["t"]
+            single_modality_index[struct_idx] = struct_single
+            struct_x_t[struct_idx] = struct_noised["x_t"]
+            aatype_x_t[struct_idx] = aatype_noised["x_t"]
+            struct_loss_mask[struct_idx] = struct_noised["mask"]
+            aa_loss_mask[struct_idx] = aatype_noised["mask"]
+
+        if ngs_idx.numel() > 0:
+            (
+                struct_noised_ngs,
+                aatype_noised_ngs,
+                ngs_single,
+            ) = self._construct_x_t_seq_only_dummy(
+                struct_target[ngs_idx], aatype_target[ngs_idx]
+            )
+            struct_t[ngs_idx] = struct_noised_ngs["t"]
+            aatype_t[ngs_idx] = aatype_noised_ngs["t"]
+            single_modality_index[ngs_idx] = ngs_single
+            struct_x_t[ngs_idx] = struct_noised_ngs["x_t"]
+            aatype_x_t[ngs_idx] = aatype_noised_ngs["x_t"]
+            struct_loss_mask[ngs_idx] = struct_noised_ngs["mask"]
+            aa_loss_mask[ngs_idx] = aatype_noised_ngs["mask"]
+
+        if self._zero_struct_loss_enabled():
+            struct_loss_mask = torch.zeros_like(struct_loss_mask)
+
+        return (
+            {"t": struct_t, "x_t": struct_x_t, "mask": struct_loss_mask},
+            {"t": aatype_t, "x_t": aatype_x_t, "mask": aa_loss_mask},
+            single_modality_index,
+        )
+
+    def _cdr_maskable_mask(self, tokens, cdr_mask_half: Optional[torch.Tensor]):
+        """non_special & CDR residues (framework excluded when enabled)."""
+        base = self.get_non_special_symbol_mask(tokens)
+        if cdr_mask_half is None:
+            return base
+        if cdr_mask_half.shape != base.shape:
+            # pad/truncate to token length
+            out = torch.zeros_like(base)
+            n = min(cdr_mask_half.size(1), base.size(1))
+            out[:, :n] = cdr_mask_half[:, :n].bool()
+            cdr_mask_half = out
+        return base & cdr_mask_half.bool()
+
+    def construct_x_t(
+        self, struct_target, aatype_target, cdr_mask=None, mask_scale: float = 1.0
+    ):
+        # Antigen-conditioned Ab design: force joint denoising of aa+struct.
+        if bool(getattr(getattr(self.cfg, "antigen_condition", None), "enable", False)):
+            joint = float(getattr(self.cfg, "joint_loss_ratio", 0.0))
+            others = (
+                float(getattr(self.cfg, "single_modality_ratio", 0.0))
+                + float(getattr(self.cfg, "folding_loss_ratio", 0.0))
+                + float(getattr(self.cfg, "inverse_folding_loss_ratio", 0.0))
+                + float(getattr(self.cfg, "independent_loss_ratio", 0.0))
+            )
+            if joint >= 0.999 and others <= 1e-6:
+                return self._construct_x_t_joint_only(
+                    struct_target,
+                    aatype_target,
+                    cdr_mask=cdr_mask,
+                    mask_scale=mask_scale,
+                )
+        return self._construct_x_t_with_targets(
+            struct_target,
+            aatype_target,
+            cdr_mask=cdr_mask,
+            mask_scale=mask_scale,
+        )
+
+    def _construct_x_t_joint_only(
+        self, struct_target, aatype_target, cdr_mask=None, mask_scale: float = 1.0
+    ):
+        """Same diffusion timestep for Ab struct and aa; both modalities supervised."""
+        bsz = struct_target.size(0)
+        device = struct_target.device
+        t = torch.randint(
+            1,
+            self.cfg.num_diffusion_timesteps + 1,
+            (bsz,),
+            device=device,
+        )
+        struct_maskable = self._cdr_maskable_mask(struct_target, cdr_mask)
+        aa_maskable = self._cdr_maskable_mask(aatype_target, cdr_mask)
+        struct_x_t, struct_loss_mask = self.q_sample(
+            struct_target,
+            t,
+            self.get_modality_type(struct_target),
+            maskable_mask=struct_maskable,
+            mask_scale=mask_scale,
+        )
+        aatype_x_t, aa_loss_mask = self.q_sample(
+            aatype_target,
+            t,
+            self.get_modality_type(aatype_target),
+            maskable_mask=aa_maskable,
+            mask_scale=mask_scale,
+        )
+        # Allow aa↔struct full attention within the antibody concat.
+        single_modality_index = torch.zeros(bsz, dtype=torch.bool, device=device)
+        return (
+            {"t": t, "x_t": struct_x_t, "mask": struct_loss_mask},
+            {"t": t, "x_t": aatype_x_t, "mask": aa_loss_mask},
+            single_modality_index,
+        )
+
+    def _construct_x_t_hybrid_noise(
+        self,
+        struct_target,
+        aatype_target,
+        cdr_mask,
+        prog_scale: float,
+        cdr_noise_ratio: float,
+    ):
+        """Mix original full masking (scale=1) with CDR-only progressive scale.
+
+        ``cdr_noise_ratio`` of the batch uses CDR maskable + ``prog_scale``;
+        the remainder uses full non-special maskable at scale 1.0.
+        """
+        bsz = struct_target.size(0)
+        device = struct_target.device
+        ratio = float(max(0.0, min(1.0, cdr_noise_ratio)))
+        n_cdr = int(round(bsz * ratio))
+        n_cdr = max(0, min(bsz, n_cdr))
+        # Prefer keeping both modes when batch is large enough.
+        if bsz >= 2 and 0 < ratio < 1:
+            n_cdr = max(1, min(bsz - 1, n_cdr))
+
+        perm = torch.randperm(bsz, device=device)
+        cdr_idx = perm[:n_cdr]
+        orig_idx = perm[n_cdr:]
+
+        struct_t = torch.zeros(bsz, dtype=torch.long, device=device)
+        aatype_t = torch.zeros(bsz, dtype=torch.long, device=device)
+        struct_x_t = struct_target.clone()
+        aatype_x_t = aatype_target.clone()
+        struct_loss_mask = torch.zeros_like(struct_target, dtype=torch.bool)
+        aa_loss_mask = torch.zeros_like(aatype_target, dtype=torch.bool)
+        single_modality_index = torch.zeros(bsz, dtype=torch.bool, device=device)
+        scale_vec = torch.ones(bsz, dtype=torch.float, device=device)
+
+        def _scatter(idx, struct_n, aa_n, single, scale_val):
+            if idx.numel() == 0:
+                return
+            struct_t[idx] = struct_n["t"]
+            aatype_t[idx] = aa_n["t"]
+            struct_x_t[idx] = struct_n["x_t"]
+            aatype_x_t[idx] = aa_n["x_t"]
+            struct_loss_mask[idx] = struct_n["mask"]
+            aa_loss_mask[idx] = aa_n["mask"]
+            single_modality_index[idx] = single
+            scale_vec[idx] = float(scale_val)
+
+        if cdr_idx.numel() > 0:
+            cdr_half = None if cdr_mask is None else cdr_mask[cdr_idx]
+            struct_n, aa_n, single = self.construct_x_t(
+                struct_target[cdr_idx],
+                aatype_target[cdr_idx],
+                cdr_mask=cdr_half,
+                mask_scale=prog_scale,
+            )
+            _scatter(cdr_idx, struct_n, aa_n, single, prog_scale)
+
+        if orig_idx.numel() > 0:
+            struct_n, aa_n, single = self.construct_x_t(
+                struct_target[orig_idx],
+                aatype_target[orig_idx],
+                cdr_mask=None,
+                mask_scale=1.0,
+            )
+            _scatter(orig_idx, struct_n, aa_n, single, 1.0)
+
+        return (
+            {
+                "t": struct_t,
+                "x_t": struct_x_t,
+                "mask": struct_loss_mask,
+                "mask_scale": scale_vec,
+            },
+            {
+                "t": aatype_t,
+                "x_t": aatype_x_t,
+                "mask": aa_loss_mask,
+                "mask_scale": scale_vec,
+            },
+            single_modality_index,
+        )
+
+    def compute_loss(self, batch, weighting="linear", global_step: int = 0):
         struct_target = batch["struct_tokens"]["targets"]
         aatype_target = batch["aatype_tokens"]["targets"]
+        cdr_mask = None
+        cdr_gen_on = bool(
+            getattr(getattr(self.cfg, "cdr_generation", None), "enable", False)
+        )
+        sched_cfg = getattr(self.cfg, "mask_schedule", None)
+        cdr_noise_ratio = float(getattr(sched_cfg, "cdr_noise_ratio", 0.0) or 0.0)
+        # Hybrid mix needs CDR annotations even when only a fraction uses them.
+        if cdr_gen_on or cdr_noise_ratio > 0:
+            cdr_mask = batch.get("cdr_mask")
+            if cdr_mask is not None:
+                cdr_mask = cdr_mask.to(struct_target.device)
 
-        (
-            struct_noised,
-            aatype_noised,
-            single_modality_index,
-        ) = self.construct_x_t(struct_target, aatype_target)
+        prog_scale = self._mask_scale(global_step)
+        # Default scalar scale for non-hybrid paths / logging.
+        mask_scale = prog_scale
+
+        if self._mixed_training_enabled() and "is_ngs" in batch:
+            (
+                struct_noised,
+                aatype_noised,
+                single_modality_index,
+            ) = self._construct_x_t_mixed(
+                struct_target,
+                aatype_target,
+                batch["is_ngs"].to(struct_target.device),
+                mask_scale=mask_scale,
+            )
+            scale_vec = None
+        elif cdr_noise_ratio > 0:
+            if cdr_mask is None:
+                raise ValueError(
+                    "mask_schedule.cdr_noise_ratio>0 requires batch['cdr_mask']; "
+                    "set datamodule.require_cdr=true"
+                )
+            (
+                struct_noised,
+                aatype_noised,
+                single_modality_index,
+            ) = self._construct_x_t_hybrid_noise(
+                struct_target,
+                aatype_target,
+                cdr_mask=cdr_mask,
+                prog_scale=prog_scale,
+                cdr_noise_ratio=cdr_noise_ratio,
+            )
+            scale_vec = struct_noised["mask_scale"]
+            mask_scale = float(scale_vec.mean().item())
+        else:
+            # Legacy: cdr_generation.enable → all CDR; else full sequence.
+            use_cdr = cdr_mask if cdr_gen_on else None
+            (
+                struct_noised,
+                aatype_noised,
+                single_modality_index,
+            ) = self.construct_x_t(
+                struct_target,
+                aatype_target,
+                cdr_mask=use_cdr,
+                mask_scale=mask_scale,
+            )
+            scale_vec = None
+
+        if self._zero_struct_loss_enabled() and not self._mixed_training_enabled():
+            struct_noised["mask"] = struct_noised["mask"].masked_fill(
+                struct_noised["mask"], False
+            )
         x_t = torch.concat([struct_noised["x_t"], aatype_noised["x_t"]], dim=1)
+        antigen_context = self.encode_antigen(batch.get("antigen"))
         if self.cfg.self_mixup.enable:
             model_outputs, mixup_loss_mask = self.self_mixup(
                 x_t=x_t,
@@ -414,25 +1134,82 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
             model_outputs = self.forward(
                 input_ids=x_t,
                 single_modality=single_modality_index,
+                antigen_hidden_states=(
+                    antigen_context["hidden_states"]
+                    if antigen_context is not None
+                    else None
+                ),
+                antigen_attention_mask=(
+                    antigen_context["attention_mask"]
+                    if antigen_context is not None
+                    else None
+                ),
             )
 
         struct_logits, aatype_logits = model_outputs["logits"].chunk(2, dim=1)
         num_timesteps = self.cfg.num_diffusion_timesteps
+        # Per-sample scale when hybrid; else scalar broadcast.
+        if scale_vec is None:
+            scale_for_t = struct_noised["t"].new_full(
+                struct_noised["t"].shape, float(mask_scale)
+            ).float()
+        else:
+            scale_for_t = scale_vec.float()
+        # Use effective_t = t * mask_scale so loss weights match actual noise.
+        struct_t_eff = (struct_noised["t"].float() * scale_for_t).clamp(min=1.0)
+        aatype_t_eff = (aatype_noised["t"].float() * scale_for_t).clamp(min=1.0)
+        # Keep t=0 (clean modality) as 0 so weight formula matches prior behavior.
+        struct_t_eff = torch.where(
+            struct_noised["t"] == 0, torch.zeros_like(struct_t_eff), struct_t_eff
+        )
+        aatype_t_eff = torch.where(
+            aatype_noised["t"] == 0, torch.zeros_like(aatype_t_eff), aatype_t_eff
+        )
         struct_weight = {
             "linear": (
-                num_timesteps - (struct_noised["t"] - 1)
-            ),  # num_timesteps * (1 - (t-1)/num_timesteps)
-            "constant": num_timesteps * torch.ones_like(struct_noised["t"]),
+                num_timesteps - (struct_t_eff - 1)
+            ),
+            "constant": num_timesteps * torch.ones_like(struct_t_eff),
         }[weighting][:, None].float() / num_timesteps
         struct_weight = struct_weight.expand(struct_target.size())
 
         aatype_weight = {
             "linear": (
-                num_timesteps - (aatype_noised["t"] - 1)
-            ),  # num_timesteps * (1 - (t-1)/num_timesteps)
-            "constant": num_timesteps * torch.ones_like(aatype_noised["t"]),
+                num_timesteps - (aatype_t_eff - 1)
+            ),
+            "constant": num_timesteps * torch.ones_like(aatype_t_eff),
         }[weighting][:, None].float() / num_timesteps
         aatype_weight = aatype_weight.expand(aatype_target.size())
+
+        aux_outputs = {
+            "mask_scale": mask_scale,
+            "cdr_noise_ratio": cdr_noise_ratio,
+            "prog_scale": prog_scale,
+        }
+        if antigen_context is not None and "antigen" in batch:
+            ab_mask = x_t.ne(self.pad_id)
+            epitope_logits = self.predict_epitopes(
+                antigen_context.get(
+                    "encoder_hidden_states", antigen_context["hidden_states"]
+                ),
+                antibody_hidden_states=model_outputs.get("last_hidden_state"),
+                antigen_attention_mask=antigen_context.get(
+                    "pad_attention_mask", antigen_context.get("attention_mask")
+                ),
+                antibody_attention_mask=ab_mask,
+            )
+            if epitope_logits is not None:
+                aux_outputs["epitope_logits"] = epitope_logits
+                if "epitope_labels" in batch["antigen"]:
+                    aux_outputs["epitope_labels"] = batch["antigen"][
+                        "epitope_labels"
+                    ].to(epitope_logits.device)
+                    aux_outputs["epitope_mask"] = batch["antigen"][
+                        "epitope_mask"
+                    ].to(epitope_logits.device)
+                    aux_outputs["epitope_loss_weight"] = float(
+                        self.cfg.antigen_condition.epitope_loss_weight
+                    )
 
         return (
             {
@@ -451,7 +1228,73 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
                 "aatype": aatype_weight,
                 "struct": struct_weight,
             },  # training loss weight
+            aux_outputs,
         )
+
+    def _get_backbone_esm(self):
+        esm = getattr(self.net, "esm", None)
+        if esm is not None:
+            return esm
+        base = getattr(self.net, "base_model", None)
+        if base is not None:
+            model = getattr(base, "model", base)
+            return getattr(model, "esm", None)
+        return None
+
+    def _enable_cross_attn_grads(self):
+        esm = self._get_backbone_esm()
+        if esm is None:
+            return
+        for layer in esm.encoder.layer:
+            if hasattr(layer, "conditional_crossattention"):
+                for p in layer.conditional_crossattention.parameters():
+                    p.requires_grad = True
+
+    def freeze_for_stage1(self):
+        for p in self.net.parameters():
+            p.requires_grad = not bool(self.cfg.two_stage.freeze_backbone)
+        self._enable_cross_attn_grads()
+        if exists(self.epitope_head):
+            for p in self.epitope_head.parameters():
+                p.requires_grad = True
+        if exists(self.epitope_feature_embed):
+            for p in self.epitope_feature_embed.parameters():
+                p.requires_grad = True
+        if exists(self.antigen_encoder):
+            for p in self.antigen_encoder.parameters():
+                p.requires_grad = not bool(self.cfg.two_stage.freeze_antigen_encoder)
+        if self.cfg.gradient_ckpt:
+            self._ensure_input_require_grads()
+        self._conditional_stage = "stage1"
+
+    def unfreeze_for_stage2(self):
+        # With LoRA: only adapters / modules_to_save, never full 650M base grads
+        # (full unfreeze previously OOM'd ~80GB at stage1→stage2).
+        if getattr(self.cfg.lora, "enable", False):
+            for name, p in self.net.named_parameters():
+                train = ("lora_" in name) or ("modules_to_save" in name)
+                p.requires_grad = train
+        else:
+            for p in self.net.parameters():
+                p.requires_grad = True
+        self._enable_cross_attn_grads()
+        if exists(self.epitope_head):
+            for p in self.epitope_head.parameters():
+                p.requires_grad = True
+        if exists(self.epitope_feature_embed):
+            for p in self.epitope_feature_embed.parameters():
+                p.requires_grad = True
+        if exists(self.antigen_encoder):
+            # Keep antigen encoder frozen in stage2 by default for memory;
+            # override via two_stage.freeze_antigen_encoder=false.
+            freeze_ag = bool(
+                getattr(self.cfg.two_stage, "freeze_antigen_encoder", True)
+            )
+            for p in self.antigen_encoder.parameters():
+                p.requires_grad = not freeze_ag
+        if self.cfg.gradient_ckpt:
+            self._ensure_input_require_grads()
+        self._conditional_stage = "stage2"
 
     def forward_encoder(self, input_tokens, **kwargs):
         return {}
@@ -480,6 +1323,7 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
         need_attn_weights=False,
         partial_masks=None,
         sampling_strategy="annealing@2.2:1.0",
+        antigen_context=None,
     ):
         output_tokens = prev_decoder_out["output_tokens"].clone()
         output_scores = prev_decoder_out["output_scores"].clone()
@@ -490,7 +1334,19 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
         output_masks = self.get_non_special_symbol_mask(
             output_tokens, partial_masks=partial_masks
         )
-        net_out = self.forward(input_ids=output_tokens)
+        net_out = self.forward(
+            input_ids=output_tokens,
+            antigen_hidden_states=(
+                antigen_context["hidden_states"]
+                if antigen_context is not None
+                else None
+            ),
+            antigen_attention_mask=(
+                antigen_context["attention_mask"]
+                if antigen_context is not None
+                else None
+            ),
+        )
 
         logits = net_out["logits"].log_softmax(dim=-1)
         attentions = net_out["attentions"] if need_attn_weights else None
@@ -746,10 +1602,12 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
         partial_masks=None,
         unmasking_strategy="stochastic1.0",  # [stochastic{temperature}, deterministic]
         sampling_strategy="annealing@2.0:0.1",
+        antigen_batch=None,
     ):
         self.eval()
         max_iter = max_iter
         temperature = temperature
+        antigen_context = self.encode_antigen(antigen_batch)
 
         # 0) encoding
         encoder_out = self.forward_encoder(input_tokens)
@@ -783,6 +1641,7 @@ class MultimodalDiffusionProteinLanguageModel(nn.Module):
                     prev_decoder_out=prev_decoder_out,
                     partial_masks=partial_masks,
                     sampling_strategy=sampling_strategy,
+                    antigen_context=antigen_context,
                 )
 
             output_tokens = decoder_out["output_tokens"]

@@ -1,0 +1,126 @@
+# @package _global_
+# Mixed stack with struct_sample_ratio=0.15 struct dose
+
+defaults:
+  - /datamodule: tokenized_protein
+  - /callbacks: lm
+  - /trainer: ddp_bf16
+
+project: DPLM2_650m_vhh_ngs_mfdesign_mixed_sr015_lora
+name: dplm2_vhh_ngs_mfdesign_mixed_sr015_lora
+
+datamodule:
+  data_dir: ${paths.data_dir}
+  csv_file: vhh_ngs_mfdesign_mixed
+  vocab_file: ${paths.root_dir}/checkpoints/dplm2_650m
+  max_tokens: 4096
+  max_len: 130
+  num_workers: 0
+  length_crop: false
+  cluster_training: false
+  min_crop_length: 60
+  struct_vocab_size: 8192
+  collater: mixed_vhh
+  struct_sample_ratio: 0.15
+
+model:
+  _target_: dplm2
+  num_diffusion_timesteps: 500
+  gradient_ckpt: false
+  training_stage: continue_train_from_dplm2
+  finetune_task: null
+  zero_struct_loss: false
+  mixed_training:
+    enable: true
+  freeze_word_embeddings: false
+  freeze_lm_head_decoder: false
+  freeze_position_embeddings: false
+  freeze_lm_head: false
+  freeze_encoder: false
+  single_modality_ratio: 0.25
+  folding_loss_ratio: 0.25
+  inverse_folding_loss_ratio: 0.25
+  joint_loss_ratio: 0.25
+  independent_loss_ratio: 0.0
+  lora:
+    enable: true
+    lora_rank: 16
+    lora_dropout: 0.1
+    lora_target_module: (esm.encoder.layer.[0-9]*.attention.(self.query|self.key|self.value|output.dense).*|esm.encoder.layer.[0-9]*.(intermediate|output).dense.*)
+    modules_to_save: lm_head,esm.embeddings
+  net:
+    arch_type: esm
+    name: ${paths.root_dir}/checkpoints/dplm2_650m
+    dropout: 0.1
+    pretrain: true
+    pretrained_model_name_or_path: ${paths.root_dir}/checkpoints/dplm2_650m
+  self_mixup:
+    enable: false
+  tokenizer:
+    vocab_file: ${paths.root_dir}/checkpoints/dplm2_650m
+    vocab_size: 8229
+  struct_tokenizer:
+    exp_path: ${paths.root_dir}/checkpoints/struct_tokenizer
+
+task:
+  _target_: lm/dplm2
+  learning:
+    watch_t1_t2_loss: false
+    cal_constant_loss: false
+    weight: linear
+  criterion:
+    _target_: byprot.modules.cross_entropy.StructAARDMCrossEntropyLoss
+    label_smoothing: 0.0
+    ignore_index: 1
+  optimizer:
+    type: adamw
+    _partial_: true
+    lr: ${train.lr}
+    betas:
+      - 0.9
+      - 0.98
+    weight_decay: 0.01
+  lr_scheduler:
+    type: polynomial
+    warmup_steps: 200
+    total_steps: ${trainer.max_steps}
+    lr: ${train.lr}
+    lr_end: 1.0e-05
+    warmup_init_lr: 1.0e-07
+    power: 1
+
+train:
+  seed: 42
+  lr: 1.0e-4
+  monitor: val/loss
+  mode: min
+  patience: 1000
+
+trainer:
+  min_epochs: 1
+  max_epochs: -1
+  devices: 1
+  strategy: auto
+  precision: bf16
+  max_steps: 1000
+  accumulate_grad_batches: 2
+  gradient_clip_val: 0.5
+  num_sanity_val_steps: 0
+  val_check_interval: 500
+  limit_val_batches: 50
+  check_val_every_n_epoch: null
+  enable_progress_bar: true
+  log_every_n_steps: 10
+
+callbacks:
+  model_checkpoint:
+    every_n_train_steps: 500
+  periodic_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.ckpt_dir}/every500
+    filename: step_{step}
+    every_n_train_steps: 500
+    save_top_k: -1
+    save_last: false
+    monitor: null
+    auto_insert_metric_name: false

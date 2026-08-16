@@ -36,6 +36,7 @@ class UniRefHFDataModule(LightningDataModule):
         max_len: int = 2048,
         num_workers: int = 0,
         num_seqs: int = 40,  # used for testing
+        tokenizer_path: Optional[str] = None,
     ):
         super().__init__()
 
@@ -89,6 +90,7 @@ class UniRefHFDataModule(LightningDataModule):
             max_batch_size=1
             if self.stage == "test" or self.stage == "predict"
             else 800,
+            tokenizer_path=self.hparams.get("tokenizer_path"),
         )
 
     def val_dataloader(self):
@@ -97,6 +99,7 @@ class UniRefHFDataModule(LightningDataModule):
             max_tokens=self.hparams.max_tokens,
             num_workers=self.hparams.num_workers,
             max_len=self.hparams.max_len,
+            tokenizer_path=self.hparams.get("tokenizer_path"),
         )
 
     def test_dataloader(self):
@@ -107,4 +110,5 @@ class UniRefHFDataModule(LightningDataModule):
             max_len=self.hparams.max_len,
             bucket_size=self.hparams.num_seqs,
             max_batch_size=self.hparams.num_seqs,
+            tokenizer_path=self.hparams.get("tokenizer_path"),
         )

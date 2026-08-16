@@ -168,3 +168,11 @@ tests/smoke_outputs/
 data-bin/scaffolding-pdbs/*.pdb
 temp.ipynb
 # run/
+
+# Local bulky artifacts (never commit)
+*.pdf
+*.tar.gz
+FoldBench_CIFs.tar.gz
+reports/
+third_party/
+src/data/

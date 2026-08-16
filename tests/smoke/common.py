@@ -27,6 +27,8 @@ def resolve_model_path(model: str | Path | None) -> Path:
             "Download with: huggingface-cli download airkingbd/dplm2_150m "
             f"--local-dir {DEFAULT_MODEL}"
         )
+    if path.suffix == ".ckpt":
+        return path.resolve()
     if not (path / "pytorch_model.bin").exists() and not (path / "config.json").exists():
         raise FileNotFoundError(f"Invalid model dir (missing weights): {path}")
     return path.resolve()
@@ -62,14 +64,28 @@ def load_dplm2(model_path: str | Path | None = None, struct_tokenizer_path: str 
 
     model_dir = resolve_model_path(model_path)
     stok_dir = resolve_struct_tokenizer(struct_tokenizer_path)
+    vocab_dir = REPO_ROOT / "checkpoints" / "dplm2_650m"
+    if not vocab_dir.is_dir():
+        vocab_dir = model_dir if model_dir.suffix != ".ckpt" else DEFAULT_MODEL
 
-    model = DPLM2.from_pretrained(
-        str(model_dir),
-        cfg_override={
-            "tokenizer": {"vocab_file": str(model_dir)},
-            "struct_tokenizer": {"exp_path": str(stok_dir)},
-        },
-    )
+    if str(model_dir).endswith(".ckpt"):
+        os.environ.setdefault("PROJECT_ROOT", str(REPO_ROOT))
+        model = DPLM2.from_pretrained(
+            str(model_dir),
+            from_huggingface=False,
+            cfg_override={
+                "tokenizer": {"vocab_file": str(vocab_dir)},
+                "struct_tokenizer": {"exp_path": str(stok_dir)},
+            },
+        )
+    else:
+        model = DPLM2.from_pretrained(
+            str(model_dir),
+            cfg_override={
+                "tokenizer": {"vocab_file": str(model_dir)},
+                "struct_tokenizer": {"exp_path": str(stok_dir)},
+            },
+        )
     model = model.eval().cuda()
     if hasattr(model.net, "merge_and_unload"):
         from peft.peft_model import PeftModel

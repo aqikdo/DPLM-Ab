@@ -256,6 +256,47 @@ class ModifiedEsmAttention(EsmAttention):
         return outputs
 
 
+class ZeroInitCrossAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_probs_dropout_prob,
+            batch_first=True,
+        )
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        # Default: zero-init so residual starts as identity. Can disable via
+        # config.cross_attn_zero_init=False (keeps nn.Linear default init).
+        if bool(getattr(config, "cross_attn_zero_init", True)):
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
+
+    def forward(
+        self,
+        hidden_states,
+        conditional_hidden_states,
+        conditional_attention_mask=None,
+    ):
+        if conditional_hidden_states is None:
+            return torch.zeros_like(hidden_states)
+        query = self.layer_norm(hidden_states)
+        key_padding_mask = None
+        if conditional_attention_mask is not None:
+            key_padding_mask = ~conditional_attention_mask.bool()
+        attn_output, _ = self.cross_attn(
+            query=query,
+            key=conditional_hidden_states,
+            value=conditional_hidden_states,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        return self.out_proj(attn_output)
+
+
 class ModifiedEsmLayer(EsmLayer):
     def __init__(self, config):
         nn.Module.__init__(self)
@@ -264,12 +305,17 @@ class ModifiedEsmLayer(EsmLayer):
         self.attention = ModifiedEsmAttention(config)
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
+        self.use_conditional_cross_attention = bool(
+            getattr(config, "conditional_cross_attention", False)
+        )
         if self.add_cross_attention:
             if not self.is_decoder:
                 raise RuntimeError(
                     f"{self} should be used as a decoder model if cross attention is added"
                 )
             self.crossattention = ModifiedEsmAttention(config)
+        if self.use_conditional_cross_attention:
+            self.conditional_crossattention = ZeroInitCrossAttention(config)
         self.intermediate = EsmIntermediate(config)
         self.output = EsmOutput(config)
         self.LayerNorm = nn.LayerNorm(
@@ -286,6 +332,8 @@ class ModifiedEsmLayer(EsmLayer):
         past_key_value=None,
         output_attentions=False,
         type_ids=None,
+        conditional_hidden_states=None,
+        conditional_attention_mask=None,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = (
@@ -342,6 +390,16 @@ class ModifiedEsmLayer(EsmLayer):
                 present_key_value + cross_attn_present_key_value
             )
 
+        if (
+            self.use_conditional_cross_attention
+            and conditional_hidden_states is not None
+        ):
+            attention_output = attention_output + self.conditional_crossattention(
+                attention_output,
+                conditional_hidden_states=conditional_hidden_states,
+                conditional_attention_mask=conditional_attention_mask,
+            )
+
         layer_output = self.feed_forward_chunk(attention_output)
 
         outputs = (layer_output,) + outputs
@@ -377,6 +435,8 @@ class ModifiedEsmEncoder(EsmEncoder):
         output_hidden_states=False,
         return_dict=True,
         type_ids=None,
+        conditional_hidden_states=None,
+        conditional_attention_mask=None,
     ):
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -414,6 +474,8 @@ class ModifiedEsmEncoder(EsmEncoder):
                     past_key_value,
                     output_attentions,
                     type_ids,
+                    conditional_hidden_states,
+                    conditional_attention_mask,
                 )
             else:
                 layer_outputs = layer_module(
@@ -425,6 +487,8 @@ class ModifiedEsmEncoder(EsmEncoder):
                     past_key_value,
                     output_attentions,
                     type_ids,
+                    conditional_hidden_states,
+                    conditional_attention_mask,
                 )
 
             hidden_states = layer_outputs[0]
@@ -497,6 +561,8 @@ class ModifiedEsmModel(EsmModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         type_ids: Optional[torch.Tensor] = None,
+        conditional_hidden_states: Optional[torch.Tensor] = None,
+        conditional_attention_mask: Optional[torch.Tensor] = None,
     ) -> Union[
         Tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions
     ]:
@@ -615,6 +681,8 @@ class ModifiedEsmModel(EsmModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             type_ids=type_ids,
+            conditional_hidden_states=conditional_hidden_states,
+            conditional_attention_mask=conditional_attention_mask,
         )
         sequence_output = encoder_outputs[0]
         pooled_output = (
@@ -663,6 +731,8 @@ class EsmForDPLM2(EsmForMaskedLM):
         return_dict=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        conditional_hidden_states=None,
+        conditional_attention_mask=None,
     ):
         if attention_mask is None:
             attention_mask = input_ids.ne(self.pad_id)
@@ -674,6 +744,8 @@ class EsmForDPLM2(EsmForMaskedLM):
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
             type_ids=type_ids,
+            conditional_hidden_states=conditional_hidden_states,
+            conditional_attention_mask=conditional_attention_mask,
         )
 
         sequence_output = outputs[0]

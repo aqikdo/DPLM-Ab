@@ -161,7 +161,16 @@ def initialize_generation(
         seq = create_init_seq(length)
         if type(seq) == tuple:
             seq_struct, seq_aa = seq
-            seq = seq_struct + seq_aa
+        else:
+            # sequence_generation: AA masks only. Build a same-length struct
+            # placeholder so concat+chunk(2) stays aligned; generate() uses AA half.
+            # IMPORTANT: use residue `length`, not len("<mask_aa>"*L) (char count).
+            seq_aa = seq
+            seq_struct = (
+                tokenizer.struct_cls_token
+                + tokenizer.struct_unk_token * length
+                + tokenizer.struct_eos_token
+            )
         init_struct_list.append(seq_struct)
         init_aa_list.append(seq_aa)
 
@@ -196,11 +205,37 @@ def initialize_generation(
     return input_tokens_batch
 
 
+def _load_model_for_generate(model_name: str, bit_model: bool = False):
+    """Load DPLM2 with local vocab/struct tokenizer paths (offline-friendly)."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent
+    vocab = repo / "checkpoints" / "dplm2_650m"
+    stok = repo / "checkpoints" / "struct_tokenizer"
+    cls = DPLM2Bit if bit_model else DPLM2
+    path = Path(model_name)
+    if str(model_name).endswith(".ckpt"):
+        return cls.from_pretrained(
+            str(model_name),
+            from_huggingface=False,
+            cfg_override={
+                "tokenizer": {"vocab_file": str(vocab)},
+                "struct_tokenizer": {"exp_path": str(stok)},
+            },
+        )
+    if path.is_dir() and (path / "vocab.txt").is_file():
+        return cls.from_pretrained(
+            str(path.resolve()),
+            cfg_override={
+                "tokenizer": {"vocab_file": str(path.resolve())},
+                "struct_tokenizer": {"exp_path": str(stok)},
+            },
+        )
+    return cls.from_pretrained(model_name)
+
+
 def unconditional_generate(args):
-    if args.bit_model:
-        model = DPLM2Bit.from_pretrained(args.model_name)
-    else:
-        model = DPLM2.from_pretrained(args.model_name)
+    model = _load_model_for_generate(args.model_name, bit_model=args.bit_model)
 
     tokenizer = model.tokenizer
     model = model.eval()
@@ -388,6 +423,7 @@ def save_results(
     elif task in [
         "backbone_generation",
         "co_generation",
+        "cdr_generation",
         "folding",
         "inverse_folding",
     ]:

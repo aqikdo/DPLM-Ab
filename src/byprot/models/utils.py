@@ -108,12 +108,24 @@ def get_net(cfg):
 
 def get_net_dplm2(cfg):
     training_stage = getattr(cfg, "training_stage", "train_from_dplm")
+    conditional_enabled = bool(
+        getattr(getattr(cfg, "antigen_condition", None), "enable", False)
+    )
 
     # dplm2 initialize from a pretrained dplm model
     if cfg.net.arch_type == "esm":
         from byprot.models.dplm2.modules.dplm2_modeling_esm import EsmForDPLM2
 
-        config = AutoConfig.from_pretrained(f"{cfg.net.name}")
+        config = AutoConfig.from_pretrained(
+            f"{cfg.net.name}", local_files_only=True
+        )
+        antigen_cfg = getattr(cfg, "antigen_condition", None)
+        config.conditional_cross_attention = bool(
+            getattr(antigen_cfg, "enable", False)
+        )
+        config.cross_attn_zero_init = bool(
+            getattr(antigen_cfg, "cross_attn_zero_init", True)
+        )
 
         # training_state == "train_from_dplm" means initializing from a pretrained sequence-based DPLM,
         # whose vocab_size is 33 containing the standerd amino acid and special tokens
@@ -151,7 +163,9 @@ def get_net_dplm2(cfg):
                     pretrained_model_name_or_path
                 ).net.state_dict()
             )
-            net.load_state_dict(pretrained_state_dict, strict=True)
+            net.load_state_dict(
+                pretrained_state_dict, strict=not conditional_enabled
+            )
 
             # expand the embedding weights
             # # initialize the new embedding with the mean and variance of pretrained embeddings.
@@ -168,19 +182,29 @@ def get_net_dplm2(cfg):
             net.lm_head.bias.data[:33] = pretrained_bias.data[:33]
         elif training_stage == "continue_train_from_dplm2":
             assert is_local
-            from byprot.models.dplm2.dplm2 import (
-                MultimodalDiffusionProteinLanguageModel,
+            hf_weights = os.path.join(
+                pretrained_model_name_or_path, "pytorch_model.bin"
             )
+            if os.path.isfile(hf_weights):
+                pretrained_state_dict = torch.load(
+                    hf_weights, map_location="cpu"
+                )
+            else:
+                from byprot.models.dplm2.dplm2 import (
+                    MultimodalDiffusionProteinLanguageModel,
+                )
 
-            pretrained_net = (
-                MultimodalDiffusionProteinLanguageModel.from_pretrained(
-                    pretrained_model_name_or_path, from_huggingface=False
-                ).net
+                pretrained_net = (
+                    MultimodalDiffusionProteinLanguageModel.from_pretrained(
+                        pretrained_model_name_or_path, from_huggingface=False
+                    ).net
+                )
+                if issubclass(type(pretrained_net), PeftModel):
+                    pretrained_net = pretrained_net.merge_and_unload()
+                pretrained_state_dict = pretrained_net.state_dict()
+            net.load_state_dict(
+                pretrained_state_dict, strict=not conditional_enabled
             )
-            if issubclass(type(pretrained_net), PeftModel):
-                pretrained_net = pretrained_net.merge_and_unload()
-            pretrained_state_dict = pretrained_net.state_dict()
-            net.load_state_dict(pretrained_state_dict, strict=True)
         else:
             raise ValueError(f"Invalid training stage {training_stage}.")
 

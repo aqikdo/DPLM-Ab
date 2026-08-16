@@ -29,7 +29,7 @@ class SortishSampler(Sampler):
         num_replicas: int = 1,
         rank: int = 0,
     ):
-        if dist.is_available():
+        if dist.is_available() and dist.is_initialized():
             num_replicas = dist.get_world_size()
             rank = dist.get_rank()
         self.data = np.argsort(sequence_lengths)
@@ -262,6 +262,93 @@ class Subset(Dataset[T_co]):
         return len(self.indices)
 
 
+class DPLM2SeqCollater(object):
+    """Collater for DPLM-2 sequence-only training on uniref_hf data."""
+
+    def __init__(self, tokenizer_path=None):
+        from byprot.datamodules.dataset.tokenized_protein import DPLM2Tokenizer
+
+        if tokenizer_path is None:
+            raise ValueError(
+                "DPLM2SeqCollater requires tokenizer_path pointing to a dplm2 checkpoint dir"
+            )
+        self.tokenizer = DPLM2Tokenizer.from_pretrained(tokenizer_path)
+
+    def __call__(self, sequences):
+        if len(list(zip(*sequences))) == 0:
+            print("list idx error!")
+            print(sequences)
+        input_data = [
+            self.tokenizer.aa_cls_token + seq[0] + self.tokenizer.aa_eos_token
+            for seq in sequences
+        ]
+        batch = self.tokenizer.batch_encode_plus(
+            input_data,
+            add_special_tokens=False,
+            padding="longest",
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": batch["input_ids"],
+            "input_mask": batch["attention_mask"].bool(),
+            "targets": batch["input_ids"].clone(),
+        }
+
+
+class DPLM2VHHMultimodalCollater(object):
+    """VHH aa sequences as multimodal batch: dummy struct half + real aa half."""
+
+    def __init__(self, tokenizer_path=None):
+        from byprot.datamodules.dataset.tokenized_protein import DPLM2Tokenizer
+
+        if tokenizer_path is None:
+            raise ValueError(
+                "DPLM2VHHMultimodalCollater requires tokenizer_path pointing to a dplm2 checkpoint dir"
+            )
+        self.tokenizer = DPLM2Tokenizer.from_pretrained(tokenizer_path)
+
+    def __call__(self, sequences):
+        if len(list(zip(*sequences))) == 0:
+            print("list idx error!")
+            print(sequences)
+        struct_inputs = []
+        aa_inputs = []
+        for seq in sequences:
+            aa_seq = seq[0]
+            core_len = len(aa_seq)
+            struct_inputs.append(
+                self.tokenizer.struct_cls_token
+                + "<unk_struct>" * core_len
+                + self.tokenizer.struct_eos_token
+            )
+            aa_inputs.append(
+                self.tokenizer.aa_cls_token + aa_seq + self.tokenizer.aa_eos_token
+            )
+
+        batch_struct = self.tokenizer.batch_encode_plus(
+            struct_inputs,
+            add_special_tokens=False,
+            padding="longest",
+            return_tensors="pt",
+        )
+        batch_aa = self.tokenizer.batch_encode_plus(
+            aa_inputs,
+            add_special_tokens=False,
+            padding="longest",
+            return_tensors="pt",
+        )
+        return {
+            "struct_tokens": {
+                "targets": batch_struct["input_ids"],
+                "attention_mask": batch_struct["attention_mask"].bool(),
+            },
+            "aatype_tokens": {
+                "targets": batch_aa["input_ids"],
+                "attention_mask": batch_aa["attention_mask"].bool(),
+            },
+        }
+
+
 class DPLMCollater(object):
     """Wrapped for OA Collater to operate on ESM w/ ESM alphabet and batch
     converter/tokens."""
@@ -306,8 +393,19 @@ def setup_dataloader(
     rank=0,
     world_size=1,
     max_len=512,
+    tokenizer_path=None,
+    collater=None,
 ) -> DataLoader:
-    collater = DPLMCollater()
+    if collater == "dplm2_vhh_multimodal":
+        collater_fn = DPLM2VHHMultimodalCollater(tokenizer_path=tokenizer_path)
+    elif collater == "dplm2_seq" or (
+        collater is None
+        and tokenizer_path is not None
+        and "dplm2" in str(tokenizer_path)
+    ):
+        collater_fn = DPLM2SeqCollater(tokenizer_path=tokenizer_path)
+    else:
+        collater_fn = DPLMCollater(tokenizer_path=tokenizer_path)
     lens = ds.get_metadata_lens()
     train_sortish_sampler = SortishSampler(
         lens, bucket_size, num_replicas=world_size, rank=rank
@@ -323,11 +421,20 @@ def setup_dataloader(
         dataset=ds,
         batch_sampler=train_sampler,
         num_workers=num_workers,
-        collate_fn=collater,
+        collate_fn=collater_fn,
     )
     return dl
 
 
 def load_dataset_from_hf(data_path, split):
+    import os
+
+    disk_path = os.path.join(data_path, split)
+    if os.path.isdir(disk_path) and os.path.isfile(
+        os.path.join(disk_path, "dataset_info.json")
+    ):
+        from datasets import load_from_disk
+
+        return load_from_disk(disk_path)
     ds = load_dataset(data_path, split=split)
     return ds
