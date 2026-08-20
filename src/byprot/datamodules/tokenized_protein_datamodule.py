@@ -47,6 +47,8 @@ class TokenizedProteinDataModule(LightningDataModule):
         collater: str = "default",
         struct_sample_ratio: Optional[float] = None,
         antigen_max_len: Optional[int] = None,
+        cdr_regions_file: Optional[str] = None,
+        require_cdr: bool = False,
     ):
         super().__init__()
 
@@ -75,6 +77,8 @@ class TokenizedProteinDataModule(LightningDataModule):
                 max_len=self.hparams.max_len,
                 antigen_max_len=getattr(self.hparams, "antigen_max_len", None),
                 struct_vocab_size=self.hparams.struct_vocab_size,
+                cdr_regions_file=getattr(self.hparams, "cdr_regions_file", None),
+                require_cdr=bool(getattr(self.hparams, "require_cdr", False)),
             )
             self.valid_dataset = TokenizedProteinDataset(
                 data_dir=self.hparams.data_dir,
@@ -84,6 +88,8 @@ class TokenizedProteinDataModule(LightningDataModule):
                 max_len=self.hparams.max_len,
                 antigen_max_len=getattr(self.hparams, "antigen_max_len", None),
                 struct_vocab_size=self.hparams.struct_vocab_size,
+                cdr_regions_file=getattr(self.hparams, "cdr_regions_file", None),
+                require_cdr=bool(getattr(self.hparams, "require_cdr", False)),
             )
             self.tokenizer = DPLM2Tokenizer.from_pretrained(
                 self.hparams.vocab_file
@@ -113,6 +119,8 @@ class TokenizedProteinDataModule(LightningDataModule):
             split="train",
             max_len=self.hparams.max_len,
             antigen_max_len=getattr(self.hparams, "antigen_max_len", None),
+            cdr_regions_file=getattr(self.hparams, "cdr_regions_file", None),
+            require_cdr=bool(getattr(self.hparams, "require_cdr", False)),
         )
         dataset_pandas = self.train_dataset.data.to_pandas()
         if self.hparams.length_crop:

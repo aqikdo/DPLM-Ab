@@ -492,6 +492,43 @@ def run_invfold_antigen(
         )
 
 
+def run_invfold_no_antigen(
+    model,
+    rows: list[dict],
+    out_dir: Path,
+    max_iter: int,
+):
+    """Ab struct only — same as standard invfold, no antigen_batch."""
+    device = next(model.parameters()).device
+    tok = model.tokenizer
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i, row in enumerate(tqdm(rows, desc="invfold (no Ag)")):
+        input_tokens, n = build_ab_invfold_tokens(
+            tok, row["struct_seq"], device
+        )
+        type_ids = model.get_modality_type(input_tokens)
+        partial_mask = type_ids == model.struct_type
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            outputs = model.generate(
+                input_tokens=input_tokens,
+                max_iter=max_iter,
+                unmasking_strategy="deterministic",
+                sampling_strategy="argmax",
+                partial_masks=partial_mask,
+                antigen_batch=None,
+            )
+        save_results(
+            outputs=outputs,
+            task="inverse_folding",
+            save_dir=str(out_dir),
+            headers=[row["sample_id"]],
+            tokenizer=tok,
+            struct_tokenizer=model.struct_tokenizer,
+            save_pdb=False,
+            continue_write=i > 0,
+        )
+
+
 def run_folding_antigen(
     model,
     rows: list[dict],
@@ -524,6 +561,41 @@ def run_folding_antigen(
                 sampling_strategy="argmax",
                 partial_masks=partial_mask,
                 antigen_batch=ag_batch,
+            )
+        save_results(
+            outputs=outputs,
+            task="folding",
+            save_dir=str(out_dir),
+            headers=[row["sample_id"]],
+            tokenizer=tok,
+            struct_tokenizer=model.struct_tokenizer,
+            save_pdb=True,
+            continue_write=i > 0,
+        )
+
+
+def run_folding_no_antigen(
+    model,
+    rows: list[dict],
+    out_dir: Path,
+    max_iter: int,
+):
+    """Ab aa given; generate Ab struct without antigen_batch."""
+    device = next(model.parameters()).device
+    tok = model.tokenizer
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i, row in enumerate(tqdm(rows, desc="folding (no Ag)")):
+        input_tokens, _ = build_ab_folding_tokens(tok, row["aa_seq"], device)
+        type_ids = model.get_modality_type(input_tokens)
+        partial_mask = type_ids == model.aa_type
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            outputs = model.generate(
+                input_tokens=input_tokens,
+                max_iter=max_iter,
+                unmasking_strategy="deterministic",
+                sampling_strategy="argmax",
+                partial_masks=partial_mask,
+                antigen_batch=None,
             )
         save_results(
             outputs=outputs,
@@ -782,8 +854,8 @@ def main():
         type=str,
         default="co_generation,inverse_folding",
         help=(
-            "comma: co_generation, inverse_folding, folding, cdr_generation, "
-            "fr_folding, fr_inverse_folding"
+            "comma: co_generation, inverse_folding, inverse_folding_no_ag, folding, folding_no_ag, "
+            "cdr_generation, fr_folding, fr_inverse_folding"
         ),
     )
     ap.add_argument(
@@ -927,6 +999,25 @@ def main():
                         args.max_iter,
                         args.antigen_max_len,
                     )
+            if "inverse_folding_no_ag" in modes:
+                inv_dir = run_dir / "inverse_folding_no_ag"
+                if _done(inv_dir / "aatype.fasta", len(rows)):
+                    print(
+                        f"[skip] {tag}/inverse_folding_no_ag already complete",
+                        flush=True,
+                    )
+                else:
+                    if (inv_dir / "aatype.fasta").is_file():
+                        (inv_dir / "aatype.fasta").unlink()
+                        st = inv_dir / "struct_token.fasta"
+                        if st.is_file():
+                            st.unlink()
+                    run_invfold_no_antigen(
+                        model,
+                        rows,
+                        inv_dir,
+                        args.max_iter,
+                    )
             if "folding" in modes:
                 fold_dir = run_dir / "folding"
                 n_pdb = len(list((fold_dir / "pdb").glob("*.pdb"))) if (fold_dir / "pdb").is_dir() else 0
@@ -948,6 +1039,34 @@ def main():
                         fold_dir,
                         args.max_iter,
                         args.antigen_max_len,
+                    )
+            if "folding_no_ag" in modes:
+                fold_dir = run_dir / "folding_no_ag"
+                n_pdb = (
+                    len(list((fold_dir / "pdb").glob("*.pdb")))
+                    if (fold_dir / "pdb").is_dir()
+                    else 0
+                )
+                if n_pdb >= len(rows):
+                    print(
+                        f"[skip] {tag}/folding_no_ag already complete ({n_pdb})",
+                        flush=True,
+                    )
+                else:
+                    if (fold_dir / "aatype.fasta").is_file():
+                        (fold_dir / "aatype.fasta").unlink()
+                    st = fold_dir / "struct_token.fasta"
+                    if st.is_file():
+                        st.unlink()
+                    pdb_dir = fold_dir / "pdb"
+                    if pdb_dir.is_dir():
+                        for p in pdb_dir.glob("*.pdb"):
+                            p.unlink()
+                    run_folding_no_antigen(
+                        model,
+                        rows,
+                        fold_dir,
+                        args.max_iter,
                     )
             if "cdr_generation" in modes:
                 cdr_dir = run_dir / "cdr_generation"
@@ -1047,6 +1166,31 @@ def main():
                     w.writerows(scored["rows"])
                 print(
                     f"[{tag}/folding] CA_RMSD={scored['ca_rmsd']:.2f}Å "
+                    f"TM={scored['bb_tmscore']:.3f} N={scored['n']} "
+                    f"CDR3={scored['regions_ca_rmsd'].get('CDR3')}",
+                    flush=True,
+                )
+                continue
+            if mode == "folding_no_ag":
+                pred_pdb = run_dir / "folding_no_ag" / "pdb"
+                if not pred_pdb.is_dir() or not any(pred_pdb.glob("*.pdb")):
+                    print(f"[warn] no pred PDB for {tag}/folding_no_ag", flush=True)
+                    continue
+                scored = score_folding(pred_pdb, gt_pdb, cdr)
+                summary["folding_no_ag"] = {
+                    "n": scored["n"],
+                    "ca_rmsd": scored["ca_rmsd"],
+                    "bb_tmscore": scored["bb_tmscore"],
+                    "regions_ca_rmsd": scored["regions_ca_rmsd"],
+                }
+                with (run_dir / "folding_no_ag" / "per_sample.csv").open(
+                    "w", newline=""
+                ) as f:
+                    w = csv.DictWriter(f, fieldnames=list(scored["rows"][0].keys()))
+                    w.writeheader()
+                    w.writerows(scored["rows"])
+                print(
+                    f"[{tag}/folding_no_ag] CA_RMSD={scored['ca_rmsd']:.2f}Å "
                     f"TM={scored['bb_tmscore']:.3f} N={scored['n']} "
                     f"CDR3={scored['regions_ca_rmsd'].get('CDR3')}",
                     flush=True,

@@ -1,0 +1,162 @@
+# @package _global_
+# Pure antigen-conditioned inverse folding (inv=1.0, fold=0.0).
+# Init from no-Ag stage2 LoRA; Ag encoder + epitope head + Ab→Ag cross-attn
+# + epitope 0/1 feature on Ag states. Hard epitope key-mask stays OFF.
+
+defaults:
+  - /datamodule: tokenized_protein
+  - /callbacks: lm
+  - /trainer: ddp_bf16
+
+project: DPLM2_650m_vhh_mfdesign_antigen_inv_only_epi_feat
+name: inv100_ag_epi_feat
+
+datamodule:
+  data_dir: ${paths.data_dir}
+  csv_file: mfdesign_vhh_antigen
+  vocab_file: ${paths.root_dir}/checkpoints/dplm2_650m
+  max_tokens: 1024
+  max_len: 130
+  antigen_max_len: 256
+  num_workers: 0
+  length_crop: false
+  cluster_training: false
+  min_crop_length: 60
+  struct_vocab_size: 8192
+  require_cdr: true
+  cdr_regions_file: ${paths.root_dir}/data-bin/mfdesign_vhh_antigen/cdr_regions_anarci_chothia.json
+
+model:
+  _target_: dplm2
+  num_diffusion_timesteps: 500
+  gradient_ckpt: true
+  training_stage: continue_train_from_dplm2
+  finetune_task: null
+  zero_struct_loss: false
+  freeze_word_embeddings: false
+  freeze_lm_head_decoder: false
+  freeze_position_embeddings: false
+  freeze_lm_head: false
+  freeze_encoder: false
+  single_modality_ratio: 0.0
+  folding_loss_ratio: 0.0
+  inverse_folding_loss_ratio: 1.0
+  independent_loss_ratio: 0.0
+  joint_loss_ratio: 0.0
+  cdr_generation:
+    enable: true
+  mask_schedule:
+    enable: true
+    warmup_steps: 1500
+    min_scale: 0.1
+    max_scale: 1.0
+    schedule: linear
+    cdr_noise_ratio: 0.5
+  lora:
+    enable: true
+    lora_rank: 16
+    lora_dropout: 0.1
+    lora_target_module: (esm.encoder.layer.[0-9]*.attention.(self.query|self.key|self.value|output.dense).*|esm.encoder.layer.[0-9]*.(intermediate|output).dense.*)
+    modules_to_save: lm_head,esm.embeddings
+  net:
+    arch_type: esm
+    name: ${paths.root_dir}/checkpoints/dplm2_650m
+    dropout: 0.1
+    pretrain: true
+    pretrained_model_name_or_path: ${paths.root_dir}/checkpoints/dplm2_650m
+  antigen_condition:
+    enable: true
+    freeze_encoder: true
+    epitope_loss_weight: 0.1
+    epitope_cross_attn_feature: true
+    epitope_cross_attn_mask: false
+    cross_attn_zero_init: false
+    cross_attn_lr_scale: 2.0
+    epitope_transformer_layers: 2
+    epitope_transformer_heads: 8
+    epitope_transformer_dropout: 0.1
+    net:
+      arch_type: esm
+      name: ${paths.root_dir}/checkpoints/dplm2_650m
+      dropout: 0.1
+      pretrain: true
+      pretrained_model_name_or_path: ${paths.root_dir}/checkpoints/dplm2_650m
+  two_stage:
+    enable: true
+    stage1_steps: 0
+    stage2_lr_scale: 1.0
+    freeze_backbone: true
+    freeze_antigen_encoder: true
+  self_mixup:
+    enable: false
+  tokenizer:
+    vocab_file: ${paths.root_dir}/checkpoints/dplm2_650m
+    vocab_size: 8229
+  struct_tokenizer:
+    exp_path: ${paths.root_dir}/checkpoints/struct_tokenizer
+
+task:
+  _target_: lm/dplm2
+  learning:
+    watch_t1_t2_loss: false
+    cal_constant_loss: false
+    weight: linear
+  criterion:
+    _target_: byprot.modules.cross_entropy.StructAARDMCrossEntropyLoss
+    label_smoothing: 0.0
+    ignore_index: 1
+  optimizer:
+    type: adamw
+    _partial_: true
+    lr: ${train.lr}
+    betas:
+      - 0.9
+      - 0.98
+    weight_decay: 0.01
+  lr_scheduler:
+    type: polynomial
+    warmup_steps: 200
+    total_steps: ${trainer.max_steps}
+    lr: ${train.lr}
+    lr_end: 1.0e-05
+    warmup_init_lr: 1.0e-07
+    power: 1
+
+train:
+  seed: 42
+  lr: 1.0e-4
+  monitor: val/loss
+  mode: min
+  patience: 1000
+  force_restart: true
+  init_from_ckpt: ${paths.root_dir}/logs/dplm2_vhh_stage2_from_s1k_sr025_lora/checkpoints/every500/step_1000.ckpt
+
+trainer:
+  min_epochs: 1
+  max_epochs: -1
+  devices: 1
+  strategy: auto
+  precision: bf16
+  max_steps: 1500
+  accumulate_grad_batches: 8
+  gradient_clip_val: 0.5
+  num_sanity_val_steps: 0
+  val_check_interval: 100
+  check_val_every_n_epoch: null
+  enable_progress_bar: true
+  log_every_n_steps: 10
+
+callbacks:
+  model_checkpoint:
+    every_n_train_steps: 250
+    save_top_k: 1
+    save_last: false
+  periodic_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.ckpt_dir}/every250
+    filename: step_{step}
+    every_n_train_steps: 250
+    save_top_k: -1
+    save_last: false
+    monitor: null
+    auto_insert_metric_name: false

@@ -1,5 +1,6 @@
 import math
 import os
+from pathlib import Path
 from typing import Iterable, Optional, Sequence, TypeVar
 
 import datasets
@@ -308,9 +309,12 @@ class TokenizedProteinDataset(Dataset):
         antigen_max_len: Optional[int] = None,
         vocab_file="airkingbd/dplm2_650m",
         struct_vocab_size=8192,
+        cdr_regions_file: Optional[str] = None,
+        require_cdr: bool = False,
     ):
-        self.data_dir = data_dir
+        self.data_dir = str(data_dir)
         self.split = split
+        csv_file = str(csv_file)
         csv_path = os.path.join(self.data_dir, csv_file)
         data_path = os.path.join(self.data_dir, csv_file.replace(".csv", ""))
         try:
@@ -323,7 +327,48 @@ class TokenizedProteinDataset(Dataset):
         self.antigen_max_len = (
             int(antigen_max_len) if antigen_max_len is not None else int(max_len)
         )
-        self.tokenizer = DPLM2Tokenizer.from_pretrained(vocab_file)
+        self.tokenizer = DPLM2Tokenizer.from_pretrained(str(vocab_file))
+        self.require_cdr = bool(require_cdr)
+        self.cdr_regions = {}
+        cdr_path = str(cdr_regions_file) if cdr_regions_file is not None else None
+        if cdr_path is None:
+            cand = os.path.join(
+                data_path, "cdr_regions_anarci_chothia.json"
+            )
+            if os.path.isfile(cand):
+                cdr_path = cand
+        if cdr_path and os.path.isfile(cdr_path):
+            import json
+
+            self.cdr_regions = json.loads(Path(cdr_path).read_text())
+            log.info(f"Loaded CDR regions n={len(self.cdr_regions)} from {cdr_path}")
+        elif self.require_cdr:
+            raise FileNotFoundError(
+                f"require_cdr=True but CDR file missing (csv_file={csv_file})"
+            )
+        if self.require_cdr:
+            keep = []
+            for i in range(len(self.data)):
+                row = self.data[i]
+                name = row.get("pdb_name")
+                if not name or name not in self.cdr_regions:
+                    continue
+                ann = self.cdr_regions[name]
+                seq_len = int(row.get("length") or len(row.get("aa_seq") or ""))
+                win = min(int(self.max_len), seq_len)
+                ok = True
+                for key in ("cdr1", "cdr2", "cdr3"):
+                    a, b = ann[key]
+                    if a < 0 or b >= win:
+                        ok = False
+                        break
+                if ok:
+                    keep.append(i)
+            before = len(self.data)
+            self.data = self.data.select(keep)
+            log.info(
+                f"require_cdr filter: kept {len(self.data)}/{before} for split={split}"
+            )
 
     def __len__(self):
         return len(self.data)
@@ -331,12 +376,57 @@ class TokenizedProteinDataset(Dataset):
     def get_metadata_lens(self):
         return self.data["length"]
 
+    def _build_cdr_mask(
+        self,
+        pdb_name: Optional[str],
+        seq_len: int,
+        crop_start: int,
+        crop_stop: int,
+    ):
+        """Per-residue CDR mask over cropped aa window (no CLS/EOS)."""
+        if not pdb_name or pdb_name not in self.cdr_regions:
+            return None
+        ann = self.cdr_regions[pdb_name]
+        mask = [False] * seq_len
+        for key in ("cdr1", "cdr2", "cdr3"):
+            a, b = ann[key]
+            for i in range(a, b + 1):
+                if crop_start <= i < crop_stop:
+                    mask[i - crop_start] = True
+                else:
+                    return None
+        if not any(mask):
+            return None
+        return mask
+
     def _crop_seq(self, seq: str, max_len: int):
+        # CDR training: N-terminal window so CDR indices stay valid.
         if len(seq) - max_len > 0:
+            if self.require_cdr:
+                start = 0
+                stop = max_len
+                return seq[start:stop], start, stop
             start = np.random.choice(len(seq) - max_len)
             stop = start + max_len
             return seq[start:stop], start, stop
         return seq, 0, len(seq)
+
+    def _crop_antigen_with_epitope(
+        self, seq: str, max_len: int, epitope_vals: Optional[Sequence[int]]
+    ):
+        """Prefer a window covering the densest epitope residues."""
+        if len(seq) <= max_len:
+            return seq, 0, len(seq)
+        n = len(seq)
+        if epitope_vals is None or len(epitope_vals) != n:
+            return self._crop_seq(seq, max_len)
+        labels = np.asarray(epitope_vals, dtype=np.int32)
+        window_sums = np.convolve(labels, np.ones(max_len, dtype=np.int32), mode="valid")
+        best = int(window_sums.max())
+        candidates = np.flatnonzero(window_sums == best)
+        start = int(np.random.choice(candidates))
+        stop = start + max_len
+        return seq[start:stop], start, stop
 
     def _crop_antigen_with_epitope(
         self, seq: str, max_len: int, epitope_vals: Optional[Sequence[int]]
@@ -391,6 +481,7 @@ class TokenizedProteinDataset(Dataset):
                 f"Sample {idx} missing aa_seq/seq; columns={list(row.keys())}"
             )
         aatype_tokens, start, stop = self._crop_seq(aa_raw, max_len)
+        cropped_len = stop - start
         aatype_tokens = self._wrap_aa_tokens(aatype_tokens)
 
         return_dict = {
@@ -408,10 +499,24 @@ class TokenizedProteinDataset(Dataset):
             return_dict["struct_tokens"] = self._wrap_struct_tokens(struct_tokens)
             return_dict["data_source"] = "struct"
 
-        if row.get("pdb_name"):
-            return_dict["pdb_name"] = row["pdb_name"]
+        pdb_name = row.get("pdb_name")
+        if pdb_name:
+            return_dict["pdb_name"] = pdb_name
         if row.get("chain_id"):
             return_dict["chain_id"] = row["chain_id"]
+
+        cdr_mask = self._build_cdr_mask(
+            pdb_name, seq_len=cropped_len, crop_start=start, crop_stop=stop
+        )
+        if cdr_mask is not None:
+            # Include CLS/EOS as non-CDR (False)
+            return_dict["cdr_mask"] = [False] + cdr_mask + [False]
+        elif self.require_cdr:
+            # Caller filters these; keep a zero mask so collate stays uniform.
+            return_dict["cdr_mask"] = [False] * (cropped_len + 2)
+            return_dict["cdr_missing"] = True
+        else:
+            return_dict["cdr_missing"] = True
 
         antigen_aa = (
             row.get("antigen_aa_seq")
@@ -757,6 +862,17 @@ class DPLM2Collater(object):
             "struct_tokens": batch_struct,
             "aatype_tokens": batch_aatype,
         }
+
+        if any("cdr_mask" in sample for sample in raw_batch):
+            max_len = batch_aatype["targets"].size(1)
+            cdr = torch.zeros(len(raw_batch), max_len, dtype=torch.bool)
+            for i, sample in enumerate(raw_batch):
+                m = sample.get("cdr_mask")
+                if m is None:
+                    continue
+                n = min(len(m), max_len)
+                cdr[i, :n] = torch.tensor(m[:n], dtype=torch.bool)
+            batch["cdr_mask"] = cdr
 
         if any(sample.get("has_antigen") for sample in raw_batch):
             antigen_aatype_list = []
